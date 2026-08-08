@@ -23,9 +23,14 @@ It is a pure C++ UE4SS mod. It manages **Lua mods, C++ mods and `.pak` content m
 
 ## Downloads
 
-Users do not need this repository. Grab the archive from
-**[Releases](https://github.com/summerspring-cf/DsModManager/releases)**, extract it, and run
-`install.bat`. **UE4SS is bundled** — nothing else to download.
+Users do not need this repository. Grab the archive, extract it, and run `install.bat`.
+**UE4SS is bundled** — nothing else to download.
+
+| Source | Notes |
+|---|---|
+| **[GitHub Releases](https://github.com/summerspring-cf/DsModManager/releases)** | Canonical. SHA-256 published in [SECURITY.md](SECURITY.md#5-verifying-the-release-binaries). |
+| **[Hangul Patch Studio](https://hangulpatchstudio.com/g/%EB%93%9C%EB%9E%98%EA%B3%A4%EC%86%8C%EB%93%9C-%EB%AA%A8%EB%93%9C%EB%A7%A4%EB%8B%88%EC%A0%80)** | My own distribution page. Same archive. Korean-language page, direct download, **no account or registration needed**. |
+| Nexus Mods | Currently unavailable — the upload is under automated quarantine, which is what this repository was published to help resolve. |
 
 ---
 

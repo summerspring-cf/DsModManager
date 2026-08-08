@@ -162,7 +162,18 @@ disable. Both are ordinary Win32 filesystem features and both stay within the ga
 
 ## 5. Verifying the release binaries
 
-Release: <https://github.com/summerspring-cf/DsModManager/releases/tag/v0.30>
+### Where to get the archive
+
+The Nexus Mods copy is quarantined, so it cannot be downloaded there. Two other sources serve
+the identical archive, neither of which needs an account:
+
+| Source | |
+|---|---|
+| **GitHub Releases** | <https://github.com/summerspring-cf/DsModManager/releases/tag/v0.30> — canonical |
+| **Hangul Patch Studio** | <https://hangulpatchstudio.com/g/%EB%93%9C%EB%9E%98%EA%B3%A4%EC%86%8C%EB%93%9C-%EB%AA%A8%EB%93%9C%EB%A7%A4%EB%8B%88%EC%A0%80> — my own distribution page. The page text is Korean, but the download is a direct link and needs no login or registration. |
+
+Both serve `DsCppModManager_0.30.zip`. Verify whichever you download against the hash below;
+if they ever disagree, the GitHub Release is authoritative.
 
 | File in `DsCppModManager_0.30.zip` | Size (bytes) | SHA-256 |
 |---|---|---|
