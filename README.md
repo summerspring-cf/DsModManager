@@ -1,131 +1,289 @@
-# DsModManager (DsCppModManager)
+# DsCppModManager
 
-**DragonSword: Awakening** 의 타이틀 메뉴에서 모드를 켜고 끄고 설정하는 인게임 모드매니저.
-UE4SS 위에서 도는 순수 C++ 모드다.
+An **in-game mod manager** for *DragonSword: Awakening* (Unreal Engine 5.3.2, Steam).
+It adds a **모드매니저 (Mod Manager)** entry to the title menu, opening a panel built from
+the game's own settings widgets, where you can enable/disable mods, reorder them, and change
+each mod's settings — without editing any config file.
 
-게임 설정창과 같은 위젯으로 만들어서 생김새와 조작감이 같고, **Lua 모드 · C++ 모드 ·
-`.pak` 콘텐츠 모드**를 한 화면에서 함께 관리한다.
+It is a pure C++ UE4SS mod. It manages **Lua mods, C++ mods and `.pak` content mods** side by side.
 
-> 받아서 바로 쓰실 분은 소스를 받을 필요가 없다.
-> [Releases](../../releases) 의 zip 을 풀고 `install.bat` 을 실행하면 끝이다.
-> **UE4SS 가 함께 들어 있어 따로 받지 않아도 된다.**
+> **Reviewing this repository for a security check?**
+> Start with **[SECURITY.md](SECURITY.md)** — it explains exactly what the binary does at
+> runtime, why the archive trips automated scanners, and lists SHA-256 hashes for every
+> binary in the release. Build instructions are in [§ Building](#building) below.
+>
+> **Please note up front: I did not write UE4SS.** ~98.6 % of the release archive by size is
+> [RE-UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) (MIT, Copyright (c) 2022 Narknon), included
+> **unmodified** and purely so that players who have no `ue4ss` folder do not have to install
+> it by hand. `install.bat` unpacks it only when it is missing and never touches an existing
+> installation. My own code is the ~240 KB `DsCppModManager/` folder — that is 1.4 % of the
+> archive, and all of it is in this repository. See [SECURITY.md § 0](SECURITY.md).
 
 ---
 
-## 문서
+## Downloads
 
-| 파일 | 대상 | 내용 |
+Users do not need this repository. Grab the archive from
+**[Releases](https://github.com/summerspring-cf/DsModManager/releases)**, extract it, and run
+`install.bat`. **UE4SS is bundled** — nothing else to download.
+
+---
+
+## Documentation
+
+| File | Audience | Contents |
 |---|---|---|
-| [MANUAL.md](mods/DsCppModManager/MANUAL.md) | **쓰는 사람** | 설치 · 화면 구성 · 조작 · 파일 위치 · 문제 해결 |
-| [PLUGIN_GUIDE.md](mods/DsCppModManager/PLUGIN_GUIDE.md) | **모드 만드는 사람** | `dsplugin.ini` 계약, 옵션 컨트롤 8종, 값 읽는 법 |
+| [MANUAL.md](mods/DsCppModManager/MANUAL.md) | Users | Install, screen layout, controls, file locations, troubleshooting |
+| [PLUGIN_GUIDE.md](mods/DsCppModManager/PLUGIN_GUIDE.md) | Mod authors | The `dsplugin.ini` contract, the 8 option controls, reading values back |
+| [SECURITY.md](SECURITY.md) | Reviewers | Runtime behaviour, syscall surface, hashes, provenance |
 
-## 모드 제작자에게
+*(MANUAL.md and PLUGIN_GUIDE.md are written in Korean — they ship inside the release archive
+for end users. This README and SECURITY.md are in English.)*
 
-당신의 모드에 **`dsplugin.ini` 파일 하나**만 넣으면 매니저가 옵션 패널을 대신 그려 준다.
-등록 함수 호출도, 링크할 API 도 없다 — 매니저가 폴더 생김새로 찾아낸다.
+---
+
+## Repository layout
+
+```
+mods/DsCppModManager/     The mod itself
+    main.cpp              Entire mod, single translation unit (~296 KB)
+    ue4ss_abi.hpp         Hand-transcribed UE4SS ABI (see below)
+    UE4SS.def             Export list used to link against UE4SS.dll  (committed — see note)
+    build.bat             The whole build
+    Assets/*.png          UI images, 11 files, all drawn procedurally (not game files)
+    MANUAL.md             End-user manual (Korean)
+    PLUGIN_GUIDE.md       Mod-author guide (Korean)
+    dsplugin.ini.example  Example manifest for plugin authors
+    dsmm_options.lua      Optional helper Lua mod authors may copy into their own mod
+tools/
+    package_cppmm.py      Builds the release archive
+    make_ue4ss_def.py     Provenance of UE4SS.def (see § UE4SS.def)
+    dspublish.py          Release-folder conventions (imported by package_cppmm.py)
+vendor/ue4ss/
+    UE4SS_experimental.zip   Unmodified official UE4SS build, bundled into releases
+    README.md                Which build, why that one, hashes
+```
+
+The `mods/…` nesting exists because this mod was extracted from a multi-mod repository.
+`build.bat` and `tools/package_cppmm.py` use these relative paths, so **do not move the folders**.
+
+---
+
+## Building
+
+There are **no external dependencies, no package manager, and no network access** during the
+build. Everything needed is in this repository.
+
+### Prerequisites
+
+| | |
+|---|---|
+| OS | Windows 10 / 11, x64 |
+| Compiler | **Visual Studio Build Tools 2022** with the *Desktop development with C++* workload (MSVC v143 + Windows SDK) |
+| Python | 3.x — **only** for `tools/package_cppmm.py`. Not needed to build the DLL. |
+
+### Build
+
+```bat
+mods\DsCppModManager\build.bat
+```
+
+That is the entire build. It takes about a minute.
+
+`build.bat` calls `vcvars64.bat` from a hard-coded Build Tools path:
+
+```
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat
+```
+
+If you installed Visual Studio Community/Professional instead, either edit that one line, or
+skip it by opening an **"x64 Native Tools Command Prompt for VS 2022"** and running the two
+commands below by hand:
+
+```bat
+cd mods\DsCppModManager
+
+rem 1) import library, generated from the committed export list
+lib /nologo /def:UE4SS.def /machine:x64 /out:UE4SS.lib
+
+rem 2) the mod
+cl /nologo /std:c++latest /utf-8 /EHsc /MD /O2 /W3 /D NDEBUG /LD ^
+   main.cpp /Fe:main.dll /link UE4SS.lib user32.lib shell32.lib
+```
+
+**Output:** `mods\DsCppModManager\main.dll`, about 224 KB. That is the file shipped as
+`DsCppModManager/dlls/main.dll` inside the release archive.
+
+### Build flags — why these exactly
+
+- **`/MD` Release only.** UE4SS is built against the release CRT. Linking the debug CRT gives
+  different `std::string` / `std::vector` layouts, and objects crossing the ABI boundary then
+  corrupt memory. This is not a preference; a `/MDd` build crashes on load.
+- **`/std:c++latest`** — the transcribed ABI header uses recent language features.
+- **`/utf-8`** — the source contains Korean string literals and comments.
+- No LTCG, no `/GL`, no custom sections, no packing, no obfuscation.
+
+### About `UE4SS.def` (a generated file that is committed on purpose)
+
+The mod links against UE4SS's exported C++ API. There is no import library in the UE4SS
+release, so one is generated from the DLL's export table:
+
+```
+UE4SS.dll  --(objdump -p)-->  export list  -->  UE4SS.def  --(lib.exe)-->  UE4SS.lib
+```
+
+`UE4SS.def` is a plain-text list of exported symbol names (~357 KB). It is **committed** so
+that a fresh clone builds with nothing but MSVC. `tools/make_ue4ss_def.py` documents where it
+came from, but it needs an `objdump -p` dump that is not in this repository, and its output
+path targets a different mod in the original multi-mod repo — you do not need to run it.
+
+`UE4SS.lib` and `UE4SS.exp` are regenerated by `build.bat` and are not committed.
+
+### Reproducibility
+
+MSVC output is **not** bit-for-bit reproducible (embedded timestamps and paths), so your
+`main.dll` will not hash-match the released one. It should be the same size (±a few bytes) and
+functionally identical. If you need byte-level assurance, the released DLL's SHA-256 is in
+[SECURITY.md](SECURITY.md), and the source is 100% of what goes into it — there is no
+pre-built code, no linked static library other than the Windows SDK and `UE4SS.lib` generated
+above.
+
+### Producing the release archive
+
+```bat
+python tools\package_cppmm.py
+```
+
+Writes `Plugins_Publish\DsCppModManager_<version>.zip`. The version is read from `ModVersion`
+in `main.cpp`. The script assembles: the built `main.dll`, `Assets/`, the two Korean docs, the
+generated `README.txt` and `install.bat`, and the contents of `vendor/ue4ss/UE4SS_experimental.zip`
+under a `UE4SS/` prefix.
+
+---
+
+## About the bundled UE4SS
+
+Releases of this mod **include UE4SS**.
+
+| | |
+|---|---|
+| Project | [RE-UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) — MIT License, Copyright (c) 2022 Narknon |
+| Channel / commit | `experimental`, `c838a8acaade1a0f860bdf249f039e58f4e10088` |
+| `ue4ss/UE4SS.dll` | 16,519,168 bytes |
+| `dwmapi.dll` | 71,680 bytes (UE4SS's proxy loader) |
+
+The file in `vendor/ue4ss/` is the **unmodified official archive**, byte-for-byte. Hashes are
+in [vendor/ue4ss/README.md](vendor/ue4ss/README.md) and [SECURITY.md](SECURITY.md).
+
+**Why pin this specific build:** the mod DLL is linked against the export table of *this*
+UE4SS build. The stock 3.0.1 release exports a different set, and on a mismatched build the
+mod DLL is simply refused — the game still launches normally, the mod just never appears.
+The experimental channel is a moving target, so downloading it today is not guaranteed to
+produce commit `c838a8ac`. Pinning it is the only way to make the release reliably work.
+
+UE4SS is redistributed under the MIT License; its full licence text ships as `ue4ss/LICENSE`
+inside every release archive.
+
+---
+
+## For mod authors
+
+Drop a single `dsplugin.ini` next to your mod and the manager builds your settings panel.
+There is no registration call and no API to link against — the manager discovers your mod
+from its folder shape (`Scripts\main.lua` for Lua, `dlls\main.dll` for C++).
 
 ```ini
 [plugin]
-name=내 모드
+name=My Mod
 
 [option:togglekey]
-label=표시 토글키
-type=key                     ; 사용자가 누른 키가 가상키 코드로 저장된다
+label=Toggle key
+type=key                     ; user clicks, presses a key, you get the VK code
 
 [option:markercolor]
-label=마커 색
-type=color                   ; 팔레트 + 그라데이션 + #RRGGBB 입력
+label=Marker colour
+type=color                   ; palette + gradient + #RRGGBB typing; you get 0xRRGGBB
 default=#FFD60A
 
 [option:opacity]
-label=오버레이 불투명도
+label=Overlay opacity
 type=slider
 min=0
 max=100
 default=80
 ```
 
-컨트롤 8종: `bool` 토글 · `int` 스테퍼 · 콤보박스(`choices=`) · `key` 키 지정 ·
-`color` 색상 · `check` 체크박스 · `button` 실행 버튼 · `slider` 슬라이더.
-모드당 옵션 16개까지, 자식 옵션(`parent=`) 가능.
-자세한 것은 [PLUGIN_GUIDE.md](mods/DsCppModManager/PLUGIN_GUIDE.md).
+Eight control types — `bool` toggle, `int` stepper, combo box (`choices=`), `key` bind,
+`color` picker, `check` box, `button`, `slider`. Up to 16 options per mod, with nested
+child options (`parent=`). Values land in `dsoptions.txt` next to your mod as `key=value`
+lines. Full contract: [PLUGIN_GUIDE.md](mods/DsCppModManager/PLUGIN_GUIDE.md).
 
 ---
 
-## 저장소 구조
+## Licence
 
-```
-mods/DsCppModManager/     매니저 소스 (main.cpp 단일 파일 + ue4ss_abi.hpp)
-  Assets/                 UI 이미지 (전부 코드로 그린 것 — 게임 파일이 아니다)
-tools/                    빌드·패키징 스크립트
-vendor/ue4ss/             배포에 동봉하는 UE4SS 원본 (손대지 않은 공식 zip)
-```
+**All rights reserved.** Do not redistribute this code, these images, or these documents, and
+do not publish modified builds. Ask first if you need to modify, redistribute, or reuse assets.
 
-경로가 `mods/…` 로 한 겹 들어가 있는 것은 원래 이 모드가 여러 모드를 담은 저장소에서
-나왔기 때문이다. `build.bat` 과 `tools/package_cppmm.py` 가 이 상대 경로를 그대로
-쓰므로 **폴더를 옮기지 말 것**.
+Two exceptions:
 
-### 빌드
+1. **`mods/DsCppModManager/dsmm_options.lua` may be copied freely.** It exists so plugins can
+   read the manager's settings; copy it into your own mod's `Scripts\` folder and ship it.
+   No attribution required.
+2. **`vendor/ue4ss/` is not covered by this licence.** It is RE-UE4SS under the MIT License;
+   the full text is `ue4ss/LICENSE` inside the archive.
+
+The images in `Assets/` were drawn from scratch in code to match the game's settings UI.
+No game files are extracted or redistributed.
+
+---
+
+# 한국어
+
+DragonSword: Awakening 의 타이틀 메뉴에서 모드를 켜고 끄고 설정하는 **인게임 모드매니저**.
+UE4SS 위에서 도는 순수 C++ 모드이며, **Lua · C++ · `.pak` 콘텐츠 모드**를 한 화면에서
+함께 관리한다.
+
+받아서 쓰실 분은 소스가 필요 없다 —
+[Releases](https://github.com/summerspring-cf/DsModManager/releases) 의 zip 을 풀고
+`install.bat` 을 실행하면 끝이다. **UE4SS 가 함께 들어 있어 따로 받지 않아도 된다.**
+
+## 문서
+
+| 파일 | 대상 |
+|---|---|
+| [MANUAL.md](mods/DsCppModManager/MANUAL.md) | 쓰는 사람 — 설치 · 화면 구성 · 조작 · 문제 해결 |
+| [PLUGIN_GUIDE.md](mods/DsCppModManager/PLUGIN_GUIDE.md) | 모드 만드는 사람 — `dsplugin.ini` 계약 |
+| [SECURITY.md](SECURITY.md) | 보안 검토용 (영문) — 런타임 동작 · 호출하는 API · 해시 |
+
+## 빌드
 
 ```
 mods\DsCppModManager\build.bat
 ```
 
 - MSVC Build Tools 2022 (`vcvars64.bat` 경로가 `build.bat` 에 박혀 있다)
-- **`/MD` Release 전용.** Debug STL 은 레이아웃이 달라 크래시한다
+- **`/MD` Release 전용** — Debug STL 은 레이아웃이 달라 로드 즉시 크래시한다
   (이유는 `ue4ss_abi.hpp` 머리 주석)
-- `UE4SS.def` 는 커밋되어 있으므로 그대로 빌드된다.
-  `UE4SS.lib` / `UE4SS.exp` 는 `build.bat` 이 만들어 낸다.
-- ⚠ `tools/make_ue4ss_def.py` 는 `.def` 의 **출처를 남긴 도구**다. 실행하려면
-  `objdump -p UE4SS.dll` 덤프가 필요하고 출력 경로도 이 저장소와 맞지 않는다.
-  `.def` 가 이미 있으므로 부를 일이 없다.
+- `UE4SS.def` 는 커밋되어 있으므로 새 클론에서 그대로 빌드된다.
+  `UE4SS.lib` / `UE4SS.exp` 는 `build.bat` 이 만든다
+- 외부 의존성 · 패키지 매니저 · 네트워크 접근 **없음**
 
-### 배포본 만들기
+배포본 만들기:
 
 ```
 python tools\package_cppmm.py
 ```
 
-`Plugins_Publish/DsCppModManager_<버전>.zip` 이 나온다. 버전은 `main.cpp` 의
-`ModVersion` 에서 읽는다. `vendor/ue4ss/` 의 UE4SS 와 생성한 `install.bat`,
-`README.txt` 가 함께 담긴다.
-
----
-
-## UE4SS 에 대하여
-
-이 저장소와 배포본은 **UE4SS 를 동봉한다.**
-
-| 항목 | 값 |
-|---|---|
-| 프로젝트 | [RE-UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) — MIT License, Copyright (c) 2022 Narknon |
-| 채널 · 커밋 | experimental, `c838a8acaade1a0f860bdf249f039e58f4e10088` |
-| `ue4ss/UE4SS.dll` | 16,519,168 B |
-
-**왜 하필 이 빌드인가**: 매니저 DLL 은 이 빌드의 export 목록에서 뽑은 `UE4SS.lib` 로
-링크된다. 스톡 릴리스(3.0.1)와 export 가 달라, 다른 빌드 위에서는 모드 DLL 로드가
-거부될 수 있다(게임은 정상 실행되고 모드만 안 뜬다). 실험 채널은 굴러가는 빌드라
-지금 GitHub 에서 받아도 같은 커밋이 나온다는 보장이 없어, 검증된 이 판을 고정해 둔다.
-
-자세한 근거는 [vendor/ue4ss/README.md](vendor/ue4ss/README.md).
-
----
+`Plugins_Publish/DsCppModManager_<버전>.zip` 이 나온다. 버전은 `main.cpp` 의 `ModVersion`
+에서 읽는다.
 
 ## 라이선스
 
-**All rights reserved.** 이 저장소의 코드·이미지·문서를 무단으로 재배포하거나
-개조판을 배포하지 않는다. 개조·재배포·에셋 사용이 필요하면 먼저 문의할 것.
+**All rights reserved.** 무단 재배포·개조판 배포 금지. 필요하면 먼저 문의할 것.
 
-예외 둘:
-
-1. **`mods/DsCppModManager/dsmm_options.lua` 는 자유롭게 복사해 써도 된다.**
-   플러그인이 매니저의 설정값을 읽으라고 만든 헬퍼라, 자기 모드의 `Scripts\` 폴더에
-   그대로 넣고 배포해도 좋다. 표기 의무 없음.
-2. **`vendor/ue4ss/` 는 이 라이선스가 적용되지 않는다.** RE-UE4SS 의 MIT License 를
-   따르며, 전문은 zip 안 `ue4ss/LICENSE` 에 들어 있다.
-
-`Assets/` 의 UI 이미지는 게임 설정창을 보고 **코드로 새로 그린 것**이다.
-게임 파일을 추출하거나 재배포하지 않는다.
+예외 둘: `dsmm_options.lua` 는 플러그인 제작에 자유롭게 복사 가능(표기 의무 없음),
+`vendor/ue4ss/` 는 RE-UE4SS 의 MIT 라이선스를 따른다.
 
 ---
 
