@@ -6,6 +6,7 @@
     mm.enabled()       -> 런타임 켬/끔 (dsruntime.txt; 없으면 true)
     mm.poll(defaults)  -> enabled, opts  (1초 캐시 폴링 -- 루프에서 그냥 호출)
     mm.dir()           -> 이 모드 폴더의 절대 경로
+    mm.lang()          -> 매니저 표시 언어 "ko"/"en" (모드 문구를 맞출 때)
 
   파일 계약 상세는 PLUGIN_GUIDE.md 참고.
 ]]
@@ -62,6 +63,18 @@ end
   msg 를 생략하면 "『모드이름』 변경 사항은 게임 재시작 후 적용됩니다." 기본 문구.
   신호는 1회성(매니저가 팝업 표시 후 자동 소거)이며 타이틀 화면에서 감지된다.
 ]]
+--[[
+  매니저 표시 언어 (v0.40): "ko" 또는 "en" 을 돌려준다.
+  모드가 다국어 문구를 가질 때 매니저와 같은 언어로 맞추는 용도다.
+  매니저가 Mods\DsCppModManager\dsmmlang.txt 에 방송하고, 사용자가 언어를
+  바꾸거나 게임 언어가 바뀌면 2초 안에 갱신된다. 파일이 없으면 "ko".
+]]
+function M.lang()
+    local d = readAll(modDir .. "/../DsCppModManager/dsmmlang.txt")
+    if d and d:find("en", 1, true) then return "en" end
+    return "ko"
+end
+
 function M.requestRestartPopup(msg)
     local f = io.open(modDir .. "/dsnotify.txt", "w")
     if not f then return false end

@@ -45,6 +45,8 @@
 
 #include <windows.h>
 #include <shellapi.h>
+#include <xinput.h>
+#pragma comment(lib, "xinput.lib")   // v0.40(pad): 정적 링크 -- LoadLibrary 금지(SECURITY.md 계약)
 #include <stdio.h>
 #include <stdarg.h>
 
@@ -200,6 +202,19 @@ static bool writePtrGuard(void* base, int off, void* v)
     }
 }
 
+static bool writeIntGuard(void* base, int off, int v)
+{
+    __try
+    {
+        *reinterpret_cast<int*>(reinterpret_cast<char*>(base) + off) = v;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
 static bool readBytesGuard(void* base, int off, void* out, int n)
 {
     __try
@@ -262,6 +277,34 @@ static int sehPropOffSize(RC::Unreal::FProperty* p, int* off, int* sz)
     }
 }
 
+// v0.40 9차: 엔진 할당자 브리지 -- 미검증 익스포트 첫 호출은 반드시 SEH 뒤에서
+// (전사 규율: 링크 성공은 ABI 증명이지 호출 안전 증명이 아니다)
+static int sehEngineMalloc(unsigned long long n, void** out)
+{
+    __try
+    {
+        *out = RC::Unreal::FMemory::Malloc(n, 0);
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return -2;
+    }
+}
+
+static int sehEngineFree(void* p)
+{
+    __try
+    {
+        RC::Unreal::FMemory::Free(p);
+        return 0;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return -2;
+    }
+}
+
 // ---------------------------------------------------------------- 상태
 
 static std::mutex g_mx;  // g_fnClass 보호 (콜백은 게임/로딩 스레드에서 온다)
@@ -278,8 +321,17 @@ static std::atomic<int> g_anchorFails{0};       // Create 전 단계 연속 실�
 static ULONGLONG g_lastTryMs = 0;               // 게임 스레드에서만 접근
 static thread_local bool t_busy = false;        // 재진입 가드
 
-static const wchar_t* const LABEL = L"모드매니저";  // v0.7: Lua 매니저 제거 후 정식 이름 승계
-static const wchar_t* const MOD_VER_W = L"v0.30";
+// v0.40: 표시 언어 -- 0=한국어 1=English. -1=미확정(ensureLang 이 결정한다).
+// 우선순위: dslang.txt(사용자 선택) > 게임 설정 LanguageText(0=한국어) > Windows UI 언어.
+static int g_lang = -1;
+static const wchar_t* TR(const wchar_t* ko, const wchar_t* en) { return g_lang == 1 ? en : ko; }
+static const wchar_t* trLabel() { return TR(L"모드매니저", L"ModManager"); }  // 메뉴/패널 제목 (EN 도 붙여쓰기 -- 사용자 지정)
+static void* g_langHs = nullptr;   // v0.40: [기본] 언어 콤보 알약 (히트 대상)
+static void* g_langTx = nullptr;
+static wchar_t g_langChoices[2][24] = {L"한국어(Korean)", L"English"};
+static const wchar_t* const MOD_VER_W = L"v0.40";
+static void* g_padIcon = nullptr;     // 11b: 클론 항목의 패드 Y 아이콘 위젯(SizeBox).
+                                      // 패드 사용 중에만 보인다(키퍼가 가시성 토글).
 
 /*
   ⚠ IsInGameThread() 크래시 실측 (2026-08-04 14:19, 콜스택 판독):
@@ -348,10 +400,10 @@ struct PlgOpt
 static void keyName(int vk, wchar_t* out, int cap)
 {
     out[0] = 0;
-    if (vk <= 0) { lstrcpynW(out, L"(없음)", cap); return; }
-    if (vk == VK_LBUTTON) { lstrcpynW(out, L"마우스 좌클릭", cap); return; }
-    if (vk == VK_RBUTTON) { lstrcpynW(out, L"마우스 우클릭", cap); return; }
-    if (vk == VK_MBUTTON) { lstrcpynW(out, L"마우스 휠클릭", cap); return; }
+    if (vk <= 0) { lstrcpynW(out, TR(L"(없음)", L"(none)"), cap); return; }
+    if (vk == VK_LBUTTON) { lstrcpynW(out, TR(L"마우스 좌클릭", L"Left mouse button"), cap); return; }
+    if (vk == VK_RBUTTON) { lstrcpynW(out, TR(L"마우스 우클릭", L"Right mouse button"), cap); return; }
+    if (vk == VK_MBUTTON) { lstrcpynW(out, TR(L"마우스 휠클릭", L"Middle mouse button"), cap); return; }
     UINT sc = MapVirtualKeyW((UINT)vk, MAPVK_VK_TO_VSC);
     switch (vk)
     {
@@ -363,7 +415,7 @@ static void keyName(int vk, wchar_t* out, int cap)
         default: break;
     }
     if (!sc || !GetKeyNameTextW((LONG)(sc << 16), out, cap) || !out[0])
-        swprintf(out, cap, L"키 %d", vk);
+        swprintf(out, cap, TR(L"키 %d", L"Key %d"), vk);
 }
 
 // 매니페스트에 F7 처럼 이름으로 적을 수 있게 (숫자도 허용)
@@ -432,7 +484,7 @@ struct PlgRow
     void* onText;
     bool on;
     bool pak;            // v0.27: pak(콘텐츠) 모드
-    char pakTarget[16];  // v0.27: dsplugin.ini 의 pak_target= (logicmods 기본 / paks)
+    char pakTarget[16];  // dsplugin.ini pak_target= : 기본(빈값)=~mods(에셋) / logicmods=BP모드
     char rtkey[32];  // v0.10: 매니페스트 runtime_key (없으면 빈 문자열 -> 내장표)
     int optN;
     void* expandHs;   // v0.16: 옵션 '펼치기/접기' 행 히트스팟 (접힘 UI 없으면 null)
@@ -477,7 +529,7 @@ static void* g_comboItemHs[10];  // 항목 하이라이트 Border (히트+페인
 static void* g_comboItemTx[10];  // 항목 라벨
 static void* g_comboItemMk[10];  // 우측 ◆ 마커 (호버 항목에만 표시)
 static int g_comboHover = -1;
-static int g_comboRow = -1;      // 콤보 소유자: -1 = [기본] 테스트, else g_plg 인덱스
+static int g_comboRow = -1;      // 콤보 소유자: -1 = 언어(매니저 자체), else g_plg 인덱스
 static int g_comboOpt = 0;
 static void* g_comboValTx = nullptr;  // 닫힘 알약의 값 텍스트 (선택 반영)
 static void* g_comboAnchorPill = nullptr;  // 열림 동안 포커스 외곽선으로 바꾼 알약
@@ -506,6 +558,95 @@ static int g_hexLen = 0;
 // v0.28: [기본] 탭 테스트 행 (세션 한정 값 -- 파일 계약과 무관한 UI 시연용)
 
 // v0.16: 탭 + 순서(드래그 재배치) 상태 (게임 스레드 전용, 패널 수명 한정 포인터)
+// ==================== v0.40(pad): 게임패드 ====================
+// on_update(5ms)가 XInput 을 폴링해 엣지를 래치하고, 게임 스레드 펌프가 소비한다.
+// B 버튼은 비트 없이 ESC 래치(g_pendEscMs)로 흘린다 -- 패널/콤보/색상창/팝업의
+// ESC 경로 전부가 공짜로 패드 대응이 된다.
+#define PAD_UP    0x01u
+#define PAD_DOWN  0x02u
+#define PAD_LEFT  0x04u
+#define PAD_RIGHT 0x08u
+#define PAD_A     0x10u
+#define PAD_LB    0x20u
+#define PAD_RB    0x40u
+#define PAD_Y     0x80u
+static std::atomic<unsigned> g_padEdges{0};
+static std::atomic<ULONGLONG> g_padEdgeMs{0};   // 마지막 래치 시각 (신선도 400ms)
+static std::atomic<bool> g_padPresent{false};
+static std::atomic<ULONGLONG> g_lastPadNavMs{0};   // 마지막 방향 입력 시각 (메뉴 워프 게이트)
+// 메뉴 선택 관측: 게임이 항목 선택을 옮길 때마다 BP_OnItemSelectionChanged(bool)
+// 를 부른다(타이틀 PE 카탈로그 실측). 전역 프리훅이 포인터 비교로 잡아 기록한다.
+static std::atomic<void*> g_fnSelChanged{nullptr};
+static std::atomic<void*> g_fnFocusRecv{nullptr};   // 진단: 클론 포커스 수신 증명용
+static std::atomic<void*> g_selEvtItem{nullptr};
+static std::atomic<unsigned char> g_selEvtOn{0};
+static std::atomic<void*> g_menuOption{nullptr};   // '설정' 항목 (클론 원형 sample)
+static std::atomic<void*> g_menuExit{nullptr};     // '나가기' 항목
+// 패널 패드 내비게이션: openPanel 이 행을 만들며 등록하는 목록
+struct NavItem
+{
+    int kind;        // NAVK_*
+    void* outline;   // 선택 테두리 Border (평소 투명 -- 크림색이 켜지면 선택)
+    void* rowBox;    // 스크롤 가시성 판정용
+    int row, opt;    // g_plg / g_ord 인덱스 (해당할 때)
+};
+#define NAVK_FOLDER 0
+#define NAVK_LANG   1
+#define NAVK_MOD    2
+#define NAVK_OPT    3
+#define NAVK_FOLD   4
+#define NAVK_ORD    5
+static NavItem g_nav[600];
+static int g_navN = 0;
+static int g_navSel = -1;       // -1 = 패드 미사용 (테두리 없음)
+static int g_padOrdLift = -1;   // 순서 탭: 집어든 행 (-1 = 없음)
+static void* g_lastRowOutline = nullptr;   // addRow 가 만든 마지막 테두리 (등록용)
+static void* g_lastRowBox = nullptr;
+static std::atomic<int> g_inputMode{0};    // 0=키보드/마우스 1=패드. 마지막으로 쓴 장치.
+                                           // 패드 UI(칩·힌트·선택 테두리)는 1일 때만 보인다.
+static int g_comboPadSel = -1;             // 드롭다운 안 패드 선택 (-1 = 없음)
+static void* g_chipBox[2] = {nullptr, nullptr};   // LB/RB 칩 SizeBox (표시 토글)
+static void* g_padHintBox = nullptr;       // 하단 (A)선택 (B)닫기 힌트 컨테이너
+static void* g_pcPanel = nullptr;          // 패널을 연 PlayerController (입력모드 복구용)
+static bool g_navWired = false;            // v0.40 5차: 게임 메뉴 내비 링에 클론을 끼웠는가
+static std::atomic<bool> g_padBHeld{false}; // v0.40 8차: 패드 B 물리 상태 (복구 지연용)
+static bool g_restoreInputPending = false;  // v0.40 8차: B/ESC 를 놓으면 입력모드를 돌려준다
+// v0.40 9차: 뿌리 레이어(DLayerTitleGame_C). 패드 선택은 뿌리가 내부 인덱스로
+// 항목 목록(ListTitleMenuBtn TArray)을 순회하는 구조다 -- 포커스 아님(조사 확정,
+// STATUS 9차 절). 배열에 클론을 편입하는 것이 진입의 정공 경로. 게임 스레드 전용.
+static void* g_root = nullptr;              // DLayerTitleGame_C 인스턴스
+static int g_rootArrOff = -1;               // ListTitleMenuBtn 오프셋 (런타임 해석)
+static int g_rootSnapOff = -1;              // 계측 스냅샷 시작(Load_Anim 끝) 오프셋
+static bool g_rootAdopted = false;          // 클론이 게임 항목 배열에 들어가 있는가
+static int g_memSelfTest = 0;               // 0=미시도 1=통과 -1=실패(재할당 영구 봉인)
+static std::atomic<void*> g_fnKeyDown{nullptr};   // 진단: UserWidget:OnKeyDown UFunction
+static bool g_menuCloneSel = false;         // 9차b: 메뉴 클론 선택 상태 (게임 스레드 전용)
+static int g_menuGen = 0;                   // 9차b: 메뉴 세대 -- cloneLost 마다 +1,
+                                            // 폴링의 지역 정적 잔존(오발/허위 diff)을 리셋
+static std::atomic<bool> g_padDirHeld{false};  // 10차: 방향(D패드) 물리 상태 (복구 지연용)
+static bool g_restoreWaitDir = false;          // 10차: 지연 복구가 방향키 뗌도 기다리는가
+static bool g_vstop = false;                   // 10차: 가상 정지 -- 클론을 '선택'으로 표시하고
+                                               // 게임 입력을 UIOnly 로 동결한 상태 (편입 폴백)
+static void* g_vstopGameSel = nullptr;         // 동결 순간 게임이 선택 중이던 항목 (복원용)
+static const bool g_vstopEnabled = false;      // 10차f: 동결 방식 봉인 -- 게임과 경합해
+                                               // 폭주(연속 자동 이동) 실측. 내비 그래프
+                                               // 편입으로 전환한다. 코드는 참고용으로 유지.
+static void* g_navObj = nullptr;               // 10차f: UDWidgetNavigation 인스턴스
+static void* g_navGraph[4] = {};               // RoutingTable 값 (방향별 DWidgetGraph)
+static int g_navGraphKey[4] = {};
+static int g_navGraphN = 0;
+
+static void navAdd(int kind, int row, int opt)
+{
+    if (g_navN >= 600) return;
+    g_nav[g_navN].kind = kind;
+    g_nav[g_navN].outline = g_lastRowOutline;
+    g_nav[g_navN].rowBox = g_lastRowBox;
+    g_nav[g_navN].row = row;
+    g_nav[g_navN].opt = opt;
+    ++g_navN;
+}
+
 static int g_activeTab = 0;                    // 0=모드 1=순서 (세션 동안 유지)
 static void* g_hsTab[2] = {nullptr, nullptr};  // 탭 셀 히트스팟
 struct OrderRow
@@ -563,7 +704,7 @@ enum ArmKind
 {
     ARM_NONE = 0, ARM_MOD_OFF, ARM_MOD_ON, ARM_OPT_OFF, ARM_OPT_ON,
     ARM_DEC, ARM_INC, ARM_COMBO_OPEN, ARM_FOLDER, ARM_FOLD, ARM_COMBO_ITEM,
-    ARM_KEYBIND, ARM_COLOR_OPEN, ARM_CHECK, ARM_BUTTON
+    ARM_KEYBIND, ARM_COLOR_OPEN, ARM_CHECK, ARM_BUTTON, ARM_LANG
 };
 static int g_armKind = ARM_NONE;
 static void* g_armHs = nullptr;
@@ -760,32 +901,34 @@ static float getRenderOpacity(UObject* widget, const char* tag, bool* ok)
 
 // 라벨 설정: TitleText(DTextBlock) :SetText(FText 24바이트)
 // FText 는 생성만 하고 파괴하지 않는다(의도적 미세 누수 -- ue4ss_abi.hpp 주석).
-static bool setLabel(UObject* clone, const char* phase)
+static bool setLabel(UObject* clone, const char* phase, bool strict = true)
 {
     UObject* tt = readObjProp(clone, L"TitleText", "setLabel");
     if (!tt)
     {
-        logf("WARN setLabel(%s): TitleText 없음 -- 라벨 생략", phase);
+        if (strict) logf("WARN setLabel(%s): TitleText 없음 -- 라벨 생략", phase);
         return false;
     }
     UFunction* fn = fnOf(tt, L"SetText", "setLabel");
     if (!fn || !parmsExact(fn, 24, "setLabel.SetText")) return false;
     if (RC::Unreal::FText::StaticSize() != 24)
     {
+        if (!strict) return false;
         logf("FAIL setLabel: FText::StaticSize()=%d (기대 24) -- 전사 무효", RC::Unreal::FText::StaticSize());
         g_hardFail = true;
         return false;
     }
-    RC::Unreal::FText txt(LABEL);
+    RC::Unreal::FText txt(trLabel());
     PB pb;
     memcpy(pb.b, &txt, 24);
     if (!peGuard(tt, fn, pb.b))
     {
+        if (!strict) return false;   // 키퍼(2초 주기)의 일시 SEH 로 hardFail 을 박지 않는다
         logf("FAIL setLabel(%s): SetText SEH 예외", phase);
         g_hardFail = true;
         return false;
     }
-    logf("OK setLabel(%s)", phase);
+    if (strict) logf("OK setLabel(%s)", phase);
     return true;
 }
 
@@ -1273,6 +1416,22 @@ static void utf8ToW(const std::string& s, wchar_t* out, int cap)
 }
 
 // plugins\<이름>\dsplugin.ini 를 읽어 rtkey/옵션 선언을 채운다
+// v0.40: 언어 변형 키 -- 영어 모드면 "<키>_en" 을 먼저 찾고 없으면 원본을 쓴다.
+// (AutoFood 세션 요청 2026-08-11: 모드가 두 언어 라벨을 매니페스트에 같이 실을 수
+//  있게. 매니저가 패널을 지을 때 g_lang 에 맞는 쪽을 고르므로 같은 프레임에 바뀐다
+//  -- 모드 쪽 1초 폴링 갈아끼우기의 '한 박자 지연'이 사라진다.)
+// ⚠ choices_en 은 원본과 항목 수·순서가 같아야 한다 (저장값 = 0기준 인덱스).
+static std::string iniValueLang(const std::string& ini, const char* sec, const char* key)
+{
+    if (g_lang == 1)
+    {
+        std::string k = std::string(key) + "_en";
+        std::string v = iniValue(ini, sec, k.c_str());
+        if (!v.empty()) return v;
+    }
+    return iniValue(ini, sec, key);
+}
+
 static void loadManifest(PlgRow& r)
 {
     r.rtkey[0] = 0;
@@ -1291,7 +1450,7 @@ static void loadManifest(PlgRow& r)
     }
     // v0.11: 표시 이름 -- [plugin] name=한글이름 (UTF-8). 파일 계층은 계속
     // 폴더명(r.name)을 쓰고, 이 값은 오직 패널 표기에만 쓴다.
-    std::string nm = iniValue(ini, "plugin", "name");
+    std::string nm = iniValueLang(ini, "plugin", "name");
     if (!nm.empty()) utf8ToW(nm, r.label, 64);
     // v0.27: pak 모드가 어디로 가야 하는지 (블루프린트=logicmods 기본, 에셋교체=paks)
     std::string pt = iniValue(ini, "plugin", "pak_target");
@@ -1318,9 +1477,9 @@ static void loadManifest(PlgRow& r)
         else if (_stricmp(type.c_str(), "button") == 0) o.type = 5;    // v0.29
         else if (_stricmp(type.c_str(), "slider") == 0) o.type = 6;    // v0.29
         else o.type = 0;
-        std::string bcap = iniValue(ini, secName.c_str(), "button");
+        std::string bcap = iniValueLang(ini, secName.c_str(), "button");
         if (!bcap.empty()) utf8ToW(bcap, o.btnCap, 24);
-        std::string lbl = iniValue(ini, secName.c_str(), "label");
+        std::string lbl = iniValueLang(ini, secName.c_str(), "label");
         utf8ToW(lbl.empty() ? key : lbl, o.label, 48);
         o.minV = atoi(iniValue(ini, secName.c_str(), "min").c_str());
         o.maxV = atoi(iniValue(ini, secName.c_str(), "max").c_str());
@@ -1328,7 +1487,7 @@ static void loadManifest(PlgRow& r)
         if (o.step <= 0) o.step = 1;
         if (o.maxV <= o.minV) { o.minV = 0; o.maxV = o.type ? 100 : 1; }
         // v0.15: choices=a,b,c -- 있으면 콤보박스 (값 = 0기준 인덱스, min/max 무시)
-        std::string ch = iniValue(ini, secName.c_str(), "choices");
+        std::string ch = iniValueLang(ini, secName.c_str(), "choices");
         if (!ch.empty())
         {
             size_t cp = 0;
@@ -1513,16 +1672,184 @@ static void contentPaksPath(wchar_t* out, const wchar_t* sub)
     }
 }
 
+// ---------------- v0.40: 표시 언어 결정/저장 (dslang.txt) ----------------
+// ① dslang.txt = 사용자가 콤보로 고른 값(언제나 이긴다) ② 게임 설정
+// GameUserSettings.ini 의 LanguageText(실측: 한국어 클라 = 0) ③ Windows UI 언어
+static void langFilePath(wchar_t* out)
+{
+    modRootPath(out);
+    lstrcatW(out, L"dslang.txt");
+}
+
+static int readGameLangText()   // GameUserSettings.ini 의 LanguageText. 없으면 -1
+{
+    // v0.40 6차: mtime 캐시 -- 라벨 키퍼가 150ms 로 빨라져(전환 공란 최소화) 파일을
+    // 매번 파싱하지 않는다. 쓰기 시각이 그대로면 stat 한 번으로 캐시값을 돌려준다.
+    static FILETIME s_mt = {0, 0};
+    static int s_val = -1;
+    wchar_t p[MAX_PATH * 2];
+    gameModsRoot(p);
+    upDirs(p, 4);   // = DS 폴더
+    lstrcatW(p, L"Saved\\Config\\Windows\\GameUserSettings.ini");
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (!GetFileAttributesExW(p, GetFileExInfoStandard, &fad)) return -1;
+    if (s_val >= 0 &&
+        fad.ftLastWriteTime.dwLowDateTime == s_mt.dwLowDateTime &&
+        fad.ftLastWriteTime.dwHighDateTime == s_mt.dwHighDateTime)
+        return s_val;
+    // 게임이 쓰기 핸들을 쥐고 있을 수 있어 공유 플래그를 넉넉히 준다
+    HANDLE h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    static char ini[64 * 1024];
+    DWORD rd = 0;
+    ReadFile(h, ini, sizeof(ini) - 1, &rd, nullptr);
+    CloseHandle(h);
+    ini[rd] = 0;
+    const char* f = strstr(ini, "LanguageText=");
+    if (!f) return -1;
+    s_mt = fad.ftLastWriteTime;
+    s_val = atoi(f + 13);
+    return s_val;
+}
+
+static void writeLangBroadcast()
+{
+    // v0.40: 방송 -- 매니저의 현재 언어("ko"/"en"). 플러그인이 자기 문구 언어를
+    // 매니저와 맞추는 용도다. 경로: <모드 폴더>\..\DsCppModManager\dsmmlang.txt
+    wchar_t p[MAX_PATH * 2];
+    modRootPath(p);
+    lstrcatW(p, L"dsmmlang.txt");
+    HANDLE h = CreateFileW(p, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    const char* v = (g_lang == 1) ? "en" : "ko";
+    DWORD wr = 0;
+    WriteFile(h, v, 2, &wr, nullptr);
+    CloseHandle(h);
+}
+
+static void applyLang(int l)
+{
+    g_lang = (l == 1) ? 1 : 0;
+    writeLangBroadcast();
+}
+
+static void saveLang()
+{
+    // v0.40 핀 형식: "ko 0" -- 뒤 숫자는 저장 순간의 게임 LanguageText.
+    // 게임 언어가 그대로인 동안만 핀이 유효하고, 게임 언어를 바꾸면 자동 추적으로
+    // 돌아간다 (실측 요구: 게임을 영어로 바꾸면 매니저도 English 가 되어야 한다).
+    wchar_t p[MAX_PATH * 2];
+    langFilePath(p);
+    HANDLE h = CreateFileW(p, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%s %d\n", (g_lang == 1) ? "en" : "ko", readGameLangText());
+    DWORD wr = 0;
+    if (n > 0) WriteFile(h, buf, (DWORD)n, &wr, nullptr);
+    CloseHandle(h);
+}
+
+static int resolveLang(int lt)   // lt = readGameLangText() 결과. 핀 유효하면 핀, 아니면 자동
+{
+    // v0.40: lt < 0 은 "지금은 알 수 없음"(게임이 파일을 쓰는 중 등)이지
+    // "언어가 다르다"가 아니다 -- 핀은 유지하고, 자동도 현상 유지한다.
+    // (리뷰 확정: 2초 키퍼가 저장 순간을 밟으면 언어가 한 틱 튀고 방송까지 튀었다)
+    wchar_t p[MAX_PATH * 2];
+    langFilePath(p);
+    HANDLE h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        char buf[32] = {0};
+        DWORD rd = 0;
+        ReadFile(h, buf, sizeof(buf) - 1, &rd, nullptr);
+        CloseHandle(h);
+        int pinned = (buf[0] == 'e') ? 1 : (buf[0] == 'k') ? 0 : -1;
+        const char* sp = strchr(buf, ' ');
+        if (pinned >= 0 && sp)
+        {
+            int rec = atoi(sp + 1);
+            // 모르거나(lt<0), 핀 자체가 모름 상태에서 저장됐거나(rec<0), 일치하면 유지
+            if (lt < 0 || rec < 0 || rec == lt) return pinned;
+        }
+    }
+    if (lt >= 0) return (lt == 0) ? 0 : 1;   // 실측: 한국어 클라 = 0
+    if (g_lang >= 0) return g_lang;          // 모름 -> 현상 유지
+    return (PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_KOREAN) ? 0 : 1;
+}
+
+static void ensureLang()
+{
+    if (g_lang >= 0) return;
+    applyLang(resolveLang(readGameLangText()));
+    logf("lang: 결정 -> %s", g_lang ? "en" : "ko");
+}
+
+static bool recheckLang(int lt)   // 키퍼가 부른다. 언어가 바뀌었으면 true
+{
+    int want = resolveLang(lt);
+    if (want == g_lang) return false;
+    applyLang(want);
+    logf("lang: 게임 언어 변경 감지 -> %s", g_lang ? "en" : "ko");
+    return true;
+}
+
 // 폴더 안에 .pak 이 하나라도 있는가
 static bool folderHasPak(const wchar_t* dir)
 {
+    // v0.40: IoStore 전용 모드(.utoc/.ucas 만, .pak 없음)도 발견한다
+    static const wchar_t* const PAT[2] = {L"%s\\*.pak", L"%s\\*.utoc"};
+    for (int i = 0; i < 2; ++i)
+    {
+        wchar_t pat[MAX_PATH * 2];
+        swprintf(pat, MAX_PATH * 2, PAT[i], dir);
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            FindClose(h);
+            return true;
+        }
+    }
+    return false;
+}
+
+// v0.40: plugins 루트에 pak 계열 '파일'을 그냥 넣은 경우 (실측 보고: 인식 안 됨)
+// -- 발견 규칙은 폴더 단위이므로 <파일이름>\ 폴더를 만들어 감싸준다.
+//    같은 이름의 .ucas/.utoc/.sig 짝도 zip 자동 해제와 같은 3초 스윕에서 함께 옮겨진다.
+static void wrapLoosePaks()
+{
     wchar_t pat[MAX_PATH * 2];
-    swprintf(pat, MAX_PATH * 2, L"%s\\*.pak", dir);
+    modRootPath(pat);
+    lstrcatW(pat, L"plugins\\*.*");
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE) return false;
+    if (h == INVALID_HANDLE_VALUE) return;
+    do
+    {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (!isPakFileName(fd.cFileName)) continue;
+        wchar_t stem[80];
+        lstrcpynW(stem, fd.cFileName, 80);
+        wchar_t* dot = wcsrchr(stem, L'.');
+        if (dot) *dot = 0;
+        if (!stem[0]) continue;
+        wchar_t dir[MAX_PATH * 2];
+        pluginSrcPath(dir, stem);
+        CreateDirectoryW(dir, nullptr);
+        wchar_t srcp[MAX_PATH * 2], dstp[MAX_PATH * 2];
+        pluginSrcPath(srcp, fd.cFileName);
+        swprintf(dstp, MAX_PATH * 2, L"%s\\%s", dir, fd.cFileName);
+        if (MoveFileW(srcp, dstp))
+            logf("pak: 낱개 파일 '%s' -> '%s\\' 폴더로 감쌈 (pak 모드로 인식)",
+                 u8(fd.cFileName).c_str(), u8(stem).c_str());
+        else
+            logf("WARN pak: '%s' 감싸기 실패 (err=%lu)", u8(fd.cFileName).c_str(), GetLastError());
+    } while (FindNextFileW(h, &fd));
     FindClose(h);
-    return true;
 }
 
 // 두 경로가 같은 실체(하드링크)인가 -- 파일 인덱스 비교
@@ -2025,8 +2352,12 @@ static void applyPluginState(PlgRow& r)
     // Content\Paks\<타깃>\ 에 하드링크를 걸었다 뗀다. 상태는 plugins 쪽에 남긴다.
     if (r.pak)
     {
-        const wchar_t* sub = (r.pakTarget[0] && _stricmp(r.pakTarget, "paks") == 0) ? L"~mods"
-                                                                                    : L"LogicMods";
+        // v0.40 5차: 기본은 ~mods (엔진이 에셋 교체용으로 마운트, 안전). LogicMods 는
+        // BPModLoaderMod 가 '블루프린트 모드'로 로드하려 들어 에셋 팩이 크래시했다
+        // (실측: _P 캐릭터 팩을 LogicMods 에 넣고 재시작 -> 크래시). 명시적으로
+        // pak_target=logicmods 라고 적은 BP 모드만 그쪽으로 보낸다.
+        const wchar_t* sub = (r.pakTarget[0] && _stricmp(r.pakTarget, "logicmods") == 0)
+                                 ? L"LogicMods" : L"~mods";
         int nf = linkPakFiles(r.rel[0] ? r.rel : r.name, sub, r.on);
         wchar_t pen[MAX_PATH * 2];
         pluginSrcPath(pen, r.rel[0] ? r.rel : r.name);
@@ -2114,7 +2445,7 @@ static void applyPluginState(PlgRow& r)
 */
 static ULONGLONG g_bootPrevLaunch = 0;
 static std::atomic<bool> g_safeModePending{false};
-static wchar_t g_safeModeText[300];
+static wchar_t g_safeModeText[480];   // v0.40: EN 문구 + 최장 표시명(63자)이 300을 넘는다
 
 static ULONGLONG ftToU64(const FILETIME& ft)
 {
@@ -2196,9 +2527,9 @@ static void bootStatePath(wchar_t* out)
 static void writeBootState(ULONGLONG launch, ULONGLONG exeSize, ULONGLONG exeMtime)
 {
     char buf[256];
-    int n = snprintf(buf, sizeof(buf), "launch=%llu\nexe_size=%llu\nexe_mtime=%llu\n",
+    int n = snprintf(buf, sizeof(buf), "launch=%llu\nexe_size=%llu\nexe_mtime=%llu\nmmver=%s\n",
                      (unsigned long long)launch, (unsigned long long)exeSize,
-                     (unsigned long long)exeMtime);
+                     (unsigned long long)exeMtime, u8(MOD_VER_W).c_str());
     if (n <= 0) return;
     wchar_t p[MAX_PATH * 2];
     bootStatePath(p);
@@ -2392,7 +2723,7 @@ static bool findCrashSuspect(ULONGLONG since, Suspect* out)
             if (!d.empty())
             {
                 if (d.size() >= 3 && d.compare(0, 3, "\xEF\xBB\xBF") == 0) d.erase(0, 3);
-                std::string nm = iniValue(d, "plugin", "name");
+                std::string nm = iniValueLang(d, "plugin", "name");
                 if (!nm.empty()) utf8ToW(nm, best.label, 64);
             }
         }
@@ -2420,6 +2751,7 @@ static void ftToClock(ULONGLONG t, wchar_t* out, int cap)
 // 게임 시작 직후 1회 (UpdateThread, 파일 I/O 뿐이라 안전).
 static void bootGuard()
 {
+    ensureLang();   // v0.40: 안전모드 팝업 문구의 언어를 먼저 확정한다
     wchar_t p[MAX_PATH * 2];
     bootStatePath(p);
     std::string prev = readFileA(p);
@@ -2427,6 +2759,19 @@ static void bootGuard()
     ULONGLONG prevSize = bootStateGet(prev, "exe_size");
     ULONGLONG prevMtime = bootStateGet(prev, "exe_mtime");
     g_bootPrevLaunch = prevLaunch;
+    // v0.40: 매니저 자체 업데이트는 게임 패치와 구분해 기록만 한다 (조치·팝업 없음)
+    {
+        size_t mp = prev.find("mmver=");
+        if (mp != std::string::npos)
+        {
+            size_t e = prev.find('\n', mp);
+            std::string pv = prev.substr(mp + 6, (e == std::string::npos ? prev.size() : e) - mp - 6);
+            std::string cv = u8(MOD_VER_W);
+            if (!pv.empty() && pv != cv)
+                logf("bootGuard: 모드매니저 업데이트 (%s -> %s) -- 게임 패치와 무관, 조치 없음",
+                     pv.c_str(), cv.c_str());
+        }
+    }
 
     ULONGLONG size = 0, mtime = 0;
     bool haveExe = gameExeInfo(&size, &mtime);
@@ -2453,9 +2798,11 @@ static void bootGuard()
     }
     if (updated)
     {
-        swprintf(g_safeModeText, 300,
-                 L"게임이 업데이트되어 안전을 위해 모드 %d개를 껐습니다.\n"
-                 L"모드가 새 버전에 맞는지 확인한 뒤 매니저에서 다시 켜 주세요.", off);
+        swprintf(g_safeModeText, 480,
+                 TR(L"게임이 업데이트되어 안전을 위해 모드 %d개를 껐습니다.\n"
+                    L"모드가 새 버전에 맞는지 확인한 뒤 매니저에서 다시 켜 주세요.",
+                    L"The game was updated, so %d mod(s) were switched off for safety.\n"
+                    L"Check that your mods match the new version, then re-enable them here."), off);
     }
     else
     {
@@ -2468,18 +2815,24 @@ static void bootGuard()
             const wchar_t* disp = s.label[0] ? s.label : s.name;
             logf("다잉 메시지: '%s' 가 %s 에 마지막 기록 -- \"%s\"",
                  u8(s.name).c_str(), u8(clock).c_str(), u8(s.lastLine).c_str());
-            swprintf(g_safeModeText, 300,
-                     L"직전 실행이 비정상 종료되어 모드 %d개를 껐습니다.\n\n"
-                     L"마지막으로 기록을 남긴 모드: 『%s』 (%s)\n%.90s\n\n"
-                     L"※ 확정 원인은 아닙니다. 기록이 잦은 모드가 뽑힐 수 있습니다.",
+            swprintf(g_safeModeText, 480,
+                     TR(L"직전 실행이 비정상 종료되어 모드 %d개를 껐습니다.\n\n"
+                        L"마지막으로 기록을 남긴 모드: 『%s』 (%s)\n%.90s\n\n"
+                        L"※ 확정 원인은 아닙니다. 기록이 잦은 모드가 뽑힐 수 있습니다.",
+                        L"The previous run ended abnormally, so %d mod(s) were switched off.\n\n"
+                        L"Last mod to write a log: '%s' (%s)\n%.90s\n\n"
+                        L"* Not proof of cause -- a chatty mod can get picked by accident."),
                      off, disp, clock, s.lastLine);
         }
         else
         {
-            swprintf(g_safeModeText, 300,
-                     L"직전 실행이 비정상 종료되어 모드 %d개를 껐습니다.\n"
-                     L"어느 모드가 마지막으로 동작했는지는 확인하지 못했습니다.\n"
-                     L"게임 자체 문제였다면 매니저에서 다시 켜면 됩니다.", off);
+            swprintf(g_safeModeText, 480,
+                     TR(L"직전 실행이 비정상 종료되어 모드 %d개를 껐습니다.\n"
+                        L"어느 모드가 마지막으로 동작했는지는 확인하지 못했습니다.\n"
+                        L"게임 자체 문제였다면 매니저에서 다시 켜면 됩니다.",
+                        L"The previous run ended abnormally, so %d mod(s) were switched off.\n"
+                        L"Could not tell which mod was active last.\n"
+                        L"If it was the game itself, just re-enable them here."), off);
         }
     }
     g_safeModePending.store(true, std::memory_order_relaxed);
@@ -2934,20 +3287,104 @@ static void pokeSounds(UObject* row, bool on)
     }
 }
 
+// v0.40 10차: 가상 정지 해제 -- 클론 표시를 내리고 게임이 선택 중이던 항목을
+// 복원한다. 입력 복구는 쥔 키(B/ESC/방향)를 놓은 뒤로 지연 -- 눌린 채 돌려주면
+// 게임이 그 키를 받아 오동작한다(B = 타이틀에서 게임 종료, 실측 사고).
+static void exitVstop(UObject* clone, bool waitDirRelease)
+{
+    g_vstop = false;
+    setSelectedRow(clone, false);
+    pokeSounds(clone, false);
+    if (g_vstopGameSel)
+    {   // 동결 중엔 게임이 못 그리므로 이 항목은 살아 있다(타이틀 파괴 시 cloneLost 경로)
+        UObject* gs = reinterpret_cast<UObject*>(g_vstopGameSel);
+        if (UObject* ovl = readObjProp(gs, L"OverlaySelected", "vstop"))
+            setVisibility(ovl, 4, "vstop.ovl");
+        pokeSounds(gs, true);
+        g_vstopGameSel = nullptr;
+    }
+    g_restoreInputPending = true;
+    g_restoreWaitDir = waitDirRelease;
+    logf("vstop: 해제 (%s)", waitDirRelease ? "방향 이동" : "취소");
+}
+
 // ======================= v0.2: 상태 리셋 ===================================
 
 static void closePanel(const char* why);  // 아래 패널 절에 정의
+static bool panelInputMode(bool uiOnly, UObject* focusW = nullptr);  // 아래 정의 (기본값은 여기만)
+                                                                      // 반환 = 전환 호출 실제 성공
+static int adoptAndAlign(UObject* clone, UObject* box, UObject* exitW);  // v0.40 10차: 아래 정의
+static void probeNavGraph(UObject* root);   // v0.40 10차g: 내비 그래프 재탐색용
 
 static void cloneLost(const char* why)
 {
+
     logf("클론 소실/리셋 (%s) -- 상태 초기화", why);
     // ⚠ 리뷰 확정: 패널을 참조만 버리면 스크림이 클릭을 영원히 먹는 소프트락.
     // 가드된 닫기를 "시도"한다 -- 진짜 죽은 패널이면 SEH 가 잡고 참조만 버려진다.
     if (g_panel || g_panelOpen) closePanel("cloneLost 연쇄 정리");
+    if (g_vstop || g_restoreInputPending)
+    {   // 10차b: 가상 정지/지연 복구가 잠근 게임 입력을 반드시 돌려준다(소프트락
+        // 방지). 클론 사후에는 펌프의 지연 복구 지점에 도달하지 못하므로(mc 게이트)
+        // 여기서 즉시 복구가 차악. g_vstopGameSel 은 역참조 금지(TRAPS X).
+        g_vstop = false;
+        g_vstopGameSel = nullptr;
+        g_restoreInputPending = false;
+        g_restoreWaitDir = false;
+        panelInputMode(false);
+    }
+    // v0.40 9차b: 편입 철거 -- 리플렉션 TArray 는 GC 강참조라 옛 클론이 배열에
+    // 남으면 영원히 listed(재삽입 봉쇄) + 세대마다 누적된다(리뷰 확정). 뿌리
+    // 생존을 FindAllOf 멤버십으로 먼저 확인하고(죽은 객체 무접촉), 포인터 "값"
+    // 비교만으로 제거한다 -- 클론/뿌리 역참조 없음, 읽고 쓰기는 전부 SEH 가드.
+    // 뿌리가 unlisted 면 배열도 함께 죽었으므로 손대지 않는다(TRAPS X).
+    if (g_rootAdopted && g_root && g_rootArrOff >= 0)
+    {
+        void* myc = g_myClone.load();
+        bool rootAlive = false;
+        std::vector<UObject*> lay;
+        UOG::FindAllOf(L"DLayerTitleGame_C", lay);
+        for (UObject* o : lay)
+            if ((void*)o == g_root) { rootAlive = true; break; }
+        if (rootAlive && myc)
+        {
+            struct { void* data; int num; int max; } a{};
+            if (readBytesGuard(g_root, g_rootArrOff, &a, 16) &&
+                a.data && a.num > 0 && a.num <= 16)
+            {
+                int w = 0;
+                bool okRW = true;
+                for (int r = 0; r < a.num && okRW; ++r)
+                {
+                    void* e = nullptr;
+                    okRW = readPtrGuard(a.data, r * 8, &e);
+                    if (okRW && e != myc)
+                    {
+                        if (w != r) okRW = writePtrGuard(a.data, w * 8, e);
+                        ++w;
+                    }
+                }
+                if (okRW && w != a.num)
+                {
+                    writeIntGuard(g_root, g_rootArrOff + 8, w);
+                    logf("adopt: 배열에서 클론 철거 (num %d->%d)", a.num, w);
+                }
+            }
+        }
+    }
     g_myClone = nullptr;
     g_doneBox = nullptr;
     g_lastHover = false;
+    g_padIcon = nullptr;     // 11b: 클론과 함께 죽는다 (죽은 위젯 토글 금지)
     g_siblings.clear();
+    g_root = nullptr;        // 뿌리/편입 상태는 메뉴와 함께 죽는다
+    g_rootArrOff = -1;
+    g_rootSnapOff = -1;
+    g_rootAdopted = false;
+    g_navObj = nullptr;      // 10차f: 내비 기계 포인터도 메뉴와 함께 죽는다
+    g_navGraphN = 0;
+    g_menuCloneSel = false;
+    ++g_menuGen;             // 폴링의 지역 정적(s_prevIdx/s_snap)도 이 번호로 리셋된다
 }
 
 static bool cloneStillListed(void* mc)
@@ -3050,6 +3487,115 @@ static void tickScrollbar(int which, void* sb, ULONGLONG now, bool force)
     }
 }
 
+// v0.40: 패널이 열린 동안 게임(타이틀 메뉴)이 패드 입력을 처리하지 못하게 막는다.
+// 실측 사고: 패널 조작 중에도 게임이 패드를 받아, 내부 선택이 '나가기'면 A 가
+// 게임을 조용히 종료시켰다(크래시 아님 -- 정상 DETACH). B 는 설정창을 열었다.
+static bool panelInputMode(bool uiOnly, UObject* focusW)
+{   // 반환 = SetInputMode 호출이 실제로 나갔는가. vstop 은 실패 시 진입을 포기해야
+    // 한다(동결 안 됐는데 동결 전제로 굴면 게임과 이중 실행 -- 리뷰 확정).
+    UObject* pc = reinterpret_cast<UObject*>(g_pcPanel);
+    if (!pc) return false;
+    UObject* lib = findObj(L"/Script/UMG.Default__WidgetBlueprintLibrary", "inputmode");
+    if (!lib) return false;
+    UFunction* fn = fnOf(lib, uiOnly ? L"SetInputMode_UIOnlyEx" : L"SetInputMode_GameAndUIEx", "inputmode");
+    if (!fn) return false;
+    int ps = (int)fn->GetParmsSize();
+    if (ps < 18 || ps > 32)
+    {
+        logf("WARN inputmode: parmSize %d 예상 밖 -- 생략", ps);
+        return false;
+    }
+    PB pb;
+    memset(pb.b, 0, 64);
+    memcpy(pb.b + 0, &pc, 8);
+    void* w = uiOnly ? (focusW ? (void*)focusW : g_panel) : nullptr;   // UIOnly = 포커스 대상
+    memcpy(pb.b + 8, &w, 8);
+    pb.b[16] = 0;                            // EMouseLockMode::DoNotLock
+    pb.b[17] = uiOnly ? 1 : 0;               // UIOnly: bFlushInput=1 / GameAndUI: bHideCursor=0
+    if (!peGuard(lib, fn, pb.b))
+    {
+        logf("WARN inputmode: SEH");
+        return false;
+    }
+    logf("inputmode: %s (parms=%d)", uiOnly ? "UIOnly(패널 포커스)" : "GameAndUI(복구)", ps);
+    return true;
+}
+
+// v0.40 5차: 게임 메뉴 내비게이션 링에 클론을 실제로 끼운다.
+// UWidget::SetNavigationRuleExplicit(EUINavigation Dir, UWidget* To) 를 써서
+//   설정.Down = 클론 / 클론.Up = 설정 · 클론.Down = 나가기 / 나가기.Up = 클론
+// 으로 재배선한다. 그러면 게임의 패드 내비가 우리를 네이티브로 선택하고, 우리는
+// '클론이 선택됨 + A' 만 잡으면 된다 (가상 포커스·커서 워프 폐기).
+// ⚠ 게임이 UMG 내비가 아니라 자체 입력 핸들러를 쓰면 무동작(무해) -- 그 경우
+//    클론이 선택되지 않아 로그로 드러난다. EUINavigation: Up=2 Down=3 (실측 enum).
+static bool navRule(UObject* w, int dir, UObject* to)
+{
+    if (!w || !to) return false;
+    UFunction* fn = fnOf(w, L"SetNavigationRuleExplicit", "navrule");
+    if (!fn) return false;
+    int ps = (int)fn->GetParmsSize();
+    if (ps < 12 || ps > 24) { logf("WARN navrule: parmSize %d 예상 밖", ps); return false; }
+    PB pb;
+    memset(pb.b, 0, 64);
+    pb.b[0] = (unsigned char)dir;     // EUINavigation (uint8)
+    memcpy(pb.b + 8, &to, 8);         // UWidget* (8정렬)
+    if (!peGuard(w, fn, pb.b)) { logf("WARN navrule: SEH"); return false; }
+    return true;
+}
+
+static void wireNav(UObject* clone, UObject* settings, UObject* exitW, bool quiet = false)
+{
+    // v0.40 7차: 메뉴는 포커스 구동이다(실측 menufn: OnFocusReceived/OnKeyDown).
+    // 이 빌드엔 SetIsFocusable UFunction 이 없다(6차 FAIL 스팸) -- bIsFocusable
+    // 프로퍼티를 직접 1 로 쓴다. before 값이 0 이면 "클론만 포커스 불가"가 원인 확정.
+    {
+        int off = propOffset(clone, L"bIsFocusable", 1, "navwire");
+        if (off >= 0)
+        {
+            unsigned char before = 255;
+            readByteGuard(clone, off, &before);
+            writeByteGuard(clone, off, 1);
+            if (!quiet) logf("navwire: bIsFocusable off=0x%X %d -> 1", off, (int)before);
+        }
+        else if (!quiet) logf("navwire: bIsFocusable 프로퍼티 없음");
+    }
+    bool up = navRule(clone, 2, settings ? settings : exitW);
+    bool dn = navRule(clone, 3, exitW);
+    if (settings && settings != exitW) navRule(settings, 3, clone);   // 설정.Down = 클론
+    if (exitW) navRule(exitW, 2, clone);                              // 나가기.Up = 클론
+    g_navWired = up && dn;
+    if (!quiet)
+        logf("navwire: 클론.Up=%d 클론.Down=%d wired=%d", (int)up, (int)dn, (int)g_navWired);
+
+    // v0.40 11차: 실측 재해석 -- 순회의 포커스 대상은 항목 위젯이 아니라 그 안쪽
+    // 버튼(TitleMenuBtn@0x350, DButton)이다. 근거: 항목 OnFocusReceived=0 인데
+    // keyrecv(OnKeyDown)는 항목/레이어/패널에 버블링으로 뜬다 = 포커스는 안쪽 버튼,
+    // 키는 위로 버블. Slate 방향 내비가 이 버튼들 사이를 돈다(랩어라운드). 지금까지
+    // 규칙을 항목에 건 것이 헛발이었다. 이번엔 버튼끼리 명시 규칙 + 클론 버튼 포커스.
+    UObject* cBtn = readObjProp(clone, L"TitleMenuBtn", "navbtn");
+    UObject* sBtn = (settings && settings != exitW) ? readObjProp(settings, L"TitleMenuBtn", "navbtn") : nullptr;
+    UObject* eBtn = exitW ? readObjProp(exitW, L"TitleMenuBtn", "navbtn") : nullptr;
+    if (cBtn)
+    {
+        int off = propOffset(cBtn, L"bIsFocusable", 1, "navbtn");
+        if (off >= 0)
+        {
+            unsigned char before = 255;
+            readByteGuard(cBtn, off, &before);
+            writeByteGuard(cBtn, off, 1);
+            if (!quiet) logf("navbtn: 클론버튼 bIsFocusable off=0x%X %d -> 1", off, (int)before);
+        }
+        bool bu = navRule(cBtn, 2, sBtn ? sBtn : eBtn);
+        bool bd = navRule(cBtn, 3, eBtn ? eBtn : sBtn);
+        if (sBtn) navRule(sBtn, 3, cBtn);   // 설정버튼.Down = 클론버튼
+        if (eBtn) navRule(eBtn, 2, cBtn);   // 나가기버튼.Up = 클론버튼
+        if (!quiet)
+            logf("navbtn: cBtn=%p sBtn=%p eBtn=%p 클론버튼.Up=%d Down=%d",
+                 (void*)cBtn, (void*)sBtn, (void*)eBtn, (int)bu, (int)bd);
+    }
+    else if (!quiet) logf("navbtn: 클론 TitleMenuBtn 없음 -- 버튼 배선 생략");
+}
+
 static void closePanel(const char* why)
 {
     if (g_popupOpen || g_popup) closePopup("패널 닫힘 연쇄");
@@ -3072,6 +3618,20 @@ static void closePanel(const char* why)
     clearDragScroll();
     g_sldHs = nullptr;          // v0.29: 잡고 있던 슬라이더 놓기
     g_sldRow = g_sldOpt = -1;
+    g_langHs = g_langTx = nullptr;   // v0.40: 언어 콤보
+    g_navN = 0;                      // v0.40(pad): 내비 목록 무효화 (선택 인덱스는 유지)
+    g_padOrdLift = -1;
+    g_padEdges.store(0, std::memory_order_relaxed);
+    // v0.40 8차: B/ESC 를 아직 쥔 채 입력을 돌려주면 게임이 그 눌림을 받아
+    // 타이틀에서 게임을 꺼버린다(실측: B 로 패널 닫기 = 게임 종료). 놓을 때까지 지연.
+    if (g_padBHeld.load(std::memory_order_relaxed) || (GetAsyncKeyState(VK_ESCAPE) & 0x8000))
+        g_restoreInputPending = true;
+    else
+        panelInputMode(false);
+    // ⚠ g_pcPanel 은 지연 복구(panelInputMode)가 쓴다 -- 여기서 지우면 복구가
+    // PC 를 못 찾아 UIOnly 잠금이 풀리지 않는다. 재open/메뉴 vfocus 가 갱신한다.
+    g_chipBox[0] = g_chipBox[1] = nullptr;
+    g_padHintBox = nullptr;
     g_plgN = 0;  // 토글 행 포인터 일괄 무효화
     void* p = g_panel;
     g_panel = nullptr;
@@ -3099,6 +3659,8 @@ static bool openPanel(UObject* clone)
     loadSessionMods();  // v0.7: 재시작 필요 판정용 세션 스냅샷
 
     UObject* pc = UOG::FindFirstOf(L"PlayerController");
+    g_pcPanel = (void*)pc;               // v0.40: 입력모드 전환/복구용
+    recheckLang(readGameLangText());     // v0.40: 설정에서 언어를 바꾼 직후 바로 들어와도 맞춘다
     UObject* lib = findObj(L"/Script/UMG.Default__WidgetBlueprintLibrary", "panel");
     UObject* gs = findObj(L"/Script/Engine.Default__GameplayStatics", "panel");
     UObject* hostCls = findObj(L"/Script/UMG.UserWidget", "panel");
@@ -3239,7 +3801,7 @@ static bool openPanel(UObject* clone)
     if (title)
     {
         setVisibility(title, 4, "panel.title");
-        setTextOn(title, LABEL, "panel.title");
+        setTextOn(title, trLabel(), "panel.title");
         setTextColor(title, {0.97f, 0.97f, 0.98f, 1.0f}, "panel.title");
         applyFontScaled(title, 1.15f);
         UObject* s = addChildTo(row, title, "panel.title");
@@ -3350,13 +3912,38 @@ static bool openPanel(UObject* clone)
     // 악센트 14px 흰α0.20 · 버전 알약 656x62 · 보기형 버튼 683x80 외곽선 {145,157,156}
 
     const LinColor GOLD = {0.93f, 0.85f, 0.53f, 1.0f};
+    // v0.40: 선택 테두리 텍스처 -- 가운데가 투명이라 외곽선만 그려진다
+    // (Border 색만 켜면 행 전체가 칠해진다 -- 실측 지적으로 교체)
+    UObject* texSelFrame = importTex(L"select_frame.png", "panel.texSelFrame");
 
     // ---- 탭 줄: [모드][순서] (v0.16 -- 활성 = 골드 글자 + 6px 골드 밑줄,
     //      비활성 = 흐린 글자 + 2px 희미선. 밑줄들은 바닥 정렬로 이어진다) ----
-    static const wchar_t* const TAB_NAMES[2] = {L"모드", L"순서"};
+    const wchar_t* const TAB_NAMES[2] = {TR(L"모드", L"Mods"), TR(L"순서", L"Order")};  // v0.40: static 금지(언어 전환)
     if (UObject* tabRow = spawn(hCls, "panel.tabRow"))
     {
         setVisibility(tabRow, 4, "panel.tabRow");
+        // v0.40(pad): LB/RB 칩 -- 게임 설정창처럼 탭 양 옆. 아이콘 텍스처를 쓰고,
+        // 패드를 쓸 때만 보인다 (키/마 입력이 오면 즉시 숨김 -- 설정창 실측).
+        auto padChip = [&](const wchar_t* texName, int idx) {
+            UObject* cbox = spawn(sCls, "panel.padChip");
+            if (!cbox) return;
+            float cw = 64.0f, ch2 = 44.0f;
+            callBytes(cbox, L"SetWidthOverride", &cw, 4, "panel.padChip");
+            callBytes(cbox, L"SetHeightOverride", &ch2, 4, "panel.padChip");
+            // Hidden(2) = 자리 유지 -- Collapsed(1)로 접으면 탭 줄이 옆으로 민다 (실측 보고)
+            setVisibility(cbox, g_inputMode.load(std::memory_order_relaxed) == 1 ? 4 : 2, "panel.padChip");
+            UObject* ctex = importTex(texName, "panel.padChip");
+            if (UObject* cb = spawn(bCls, "panel.padChipB"))
+            {
+                if (ctex) callBytes(cb, L"SetBrushFromTexture", &ctex, 8, "panel.padChipB");
+                setBrushColor(cb, {1, 1, 1, 1}, "panel.padChipB");
+                setVisibility(cb, 4, "panel.padChipB");
+                slotAlign(addChildTo(cbox, cb, "panel.padChip"), 0, 0, "panel.padChip");
+            }
+            slotAlign(addChildTo(tabRow, cbox, "panel.padChip"), -1, 2, "panel.padChip");
+            g_chipBox[idx] = cbox;
+        };
+        padChip(L"pad_lb.png", 0);
         for (int t = 0; t < 2; ++t)
         {
             UObject* tabBox = spawn(sCls, "panel.tab");
@@ -3376,6 +3963,7 @@ static bool openPanel(UObject* clone)
             slotAlign(addChildTo(tabRow, tabBox, "panel.tab"), -1, 3, "panel.tab");
             g_hsTab[t] = tabBox;
         }
+        padChip(L"pad_rb.png", 1);
         UObject* s = addChildTo(vb, tabRow, "panel.tabRow");
         slotAlign(s, 1, -1, "panel.tabRow");
         slotPad(s, 0, 44, 0, 0, "panel.tabRow");
@@ -3475,7 +4063,22 @@ static bool openPanel(UObject* clone)
             float m[4] = {0, 0, 74, 0};  // 알약~밴드 우측단 간격 (실측)
             callBytes(band, L"SetPadding", m, 16, tag);
         }
-        slotAlign(addChildTo(rowBox, band, tag), 0, 0, tag);
+        // v0.40(pad): 선택 테두리 -- 게임 설정창의 크림색 외곽선(실측 pad.png).
+        // 평소엔 투명(알파 0)이고, 패드 선택이 오면 크림색이 켜진다. 두께 = 패딩 3.
+        UObject* selOut = spawn(bCls, tag);
+        if (selOut)
+        {
+            if (texSelFrame) callBytes(selOut, L"SetBrushFromTexture", &texSelFrame, 8, tag);
+        setBrushColor(selOut, {0.95f, 0.92f, 0.80f, 0.0f}, tag);
+            setVisibility(selOut, 4, tag);
+            float sm[4] = {3, 3, 3, 3};
+            callBytes(selOut, L"SetPadding", sm, 16, tag);
+            slotAlign(addChildTo(rowBox, selOut, tag), 0, 0, tag);
+            slotAlign(addChildTo(selOut, band, tag), 0, 0, tag);
+        }
+        else slotAlign(addChildTo(rowBox, band, tag), 0, 0, tag);
+        g_lastRowOutline = selOut;
+        g_lastRowBox = rowBox;
         UObject* hb = spawn(hCls, tag);
         if (!hb) return nullptr;
         setVisibility(hb, 4, tag);
@@ -3511,6 +4114,7 @@ static bool openPanel(UObject* clone)
     };
 
     // ==================== 탭별 콘텐츠 (v0.16) ====================
+    g_navN = 0;   // v0.40(pad): 행을 다시 만들며 다시 등록한다
     if (g_activeTab == 0)
     {
     // ---- v0.15: 닫힘 콤보 알약 공용 빌더 ----
@@ -3728,8 +4332,8 @@ static bool openPanel(UObject* clone)
     };
 
     // ---- 기본: 모드 버전 [vX.Y 알약] ----
-    addSection(L"기본", "panel.sec1");
-    if (UObject* hb = addRow(L"모드 버전", "panel.rowVer"))
+    addSection(TR(L"기본", L"General"), "panel.sec1");
+    if (UObject* hb = addRow(TR(L"모드 버전", L"Version"), "panel.rowVer"))
     {
         if (UObject* pill = spawn(sCls, "panel.verPill"))
         {
@@ -3756,7 +4360,7 @@ static bool openPanel(UObject* clone)
     }
 
     // ---- 기본 (계속): 플러그인 [폴더 바로가기] (크레딧|보기 스타일, 클릭=폴더 열기) ----
-    if (UObject* hb = addRow(L"플러그인", "panel.rowPlg"))
+    if (UObject* hb = addRow(TR(L"플러그인", L"Plugins"), "panel.rowPlg"))
     {
         if (UObject* obox = spawn(sCls, "panel.btnBox"))
         {
@@ -3775,7 +4379,7 @@ static bool openPanel(UObject* clone)
                 callBytes(outline, L"SetPadding", m, 16, "panel.btnOutline");
                 setBrushColor(fill2, {0.010f, 0.014f, 0.016f, 0.55f}, "panel.btnFill");
                 setVisibility(fill2, 4, "panel.btnFill");
-                setTextOn(bt, L"폴더 바로가기", "panel.btnTxt");
+                setTextOn(bt, TR(L"폴더 바로가기", L"Open folder"), "panel.btnTxt");
                 setTextColor(bt, {0.97f, 0.97f, 0.98f, 1.0f}, "panel.btnTxt");
                 applyFontScaled(bt, 0.9f);
                 setVisibility(bt, 4, "panel.btnTxt");
@@ -3788,13 +4392,21 @@ static bool openPanel(UObject* clone)
             }
             slotAlign(addChildTo(hb, obox, "panel.btnBox"), -1, 2, "panel.btnBox");
         }
+        navAdd(NAVK_FOLDER, -1, -1);   // v0.40(pad)
     }
 
+    // ---- 기본 (계속): 언어(Language) -- 매니저 자체 UI 언어 [v0.40] ----
+    g_langHs = g_langTx = nullptr;
+    if (UObject* hb = addRow(TR(L"언어(Language)", L"Language"), "panel.rowLang"))
+    {
+        makeCombo(hb, g_langChoices[g_lang == 1 ? 1 : 0], &g_langHs, &g_langTx);
+        navAdd(NAVK_LANG, -1, -1);   // v0.40(pad)
+    }
 
     // ---- 모드선택: plugins 폴더 스캔 -> 인식된 모드 행 (v0.5: 표시만, 토글은 다음 단계) ----
     // 인식 규칙 = UE4SS 표준 모드 폴더 구조: <이름>\Scripts\main.lua (Lua) 또는
     // <이름>\dlls\main.dll (C++). 등록 함수 호출 같은 능동 절차는 없다 -- 존재만으로 발견.
-    addSection(L"모드선택", "panel.sec2");
+    addSection(TR(L"모드선택", L"Mods"), "panel.sec2");
     {
         // 토글 텍스처 (설정창 끄기/켜기 픽셀 실측: 컨테이너 678x76 r20, 알약 332x66 r26)
         UObject* texBg = importTex(L"toggle_bg.png", "panel.texBg");
@@ -3818,7 +4430,7 @@ static bool openPanel(UObject* clone)
             setVisibility(hbx, 4, "panel.tglRow");
             slotAlign(addChildTo(ctl, bgB, "panel.tgl"), 0, 0, "panel.tgl");
             slotAlign(addChildTo(bgB, hbx, "panel.tgl"), 0, 0, "panel.tgl");
-            const wchar_t* caps[2] = {L"끄기", L"켜기"};
+            const wchar_t* caps[2] = {TR(L"끄기", L"Off"), TR(L"켜기", L"On")};
             void* pills[2] = {nullptr, nullptr};
             void* texts[2] = {nullptr, nullptr};
             for (int k = 0; k < 2; ++k)
@@ -3887,9 +4499,24 @@ static bool openPanel(UObject* clone)
                 }
                 if (UObject* hb2 = addRow(r.label[0] ? r.label : r.name, "panel.rowMod"))
                 {
+                    {   // v0.40: 모드 종류 (Lua / C++ / pak) -- 라벨과 토글 사이 (실측 mod1.png)
+                        const wchar_t* kindTxt = ents[k].pak ? L"pak" : (cppMod ? L"C++" : L"Lua");
+                        if (UObject* kt = spawn(tCls, "panel.modKind"))
+                        {
+                            setVisibility(kt, 4, "panel.modKind");
+                            setTextOn(kt, kindTxt, "panel.modKind");
+                            setTextColor(kt, {0.52f, 0.57f, 0.62f, 1.0f}, "panel.modKind");
+                            applyFontScaled(kt, 0.8f);
+                            UObject* ks = addChildTo(hb2, kt, "panel.modKind");
+                            slotAlign(ks, -1, 2, "panel.modKind");
+                            slotPad(ks, 0, 0, 28, 0, "panel.modKind");
+                        }
+                    }
                     bool built = makeToggle(hb2, &r.offPill, &r.onPill, &r.offText, &r.onText);
                     if (built)
                     {
+                        navAdd(NAVK_MOD, g_plgN, -1);   // v0.40(pad): built 확정 뒤 등록 -- 실패 행이
+                                                        // 다음 모드의 슬롯을 가리키는 별칭 사고 방지
                         paintToggle(r);
                         // ---- 켜진 모드의 옵션 서브행 (들여쓴 라벨 + 토글/스테퍼) ----
                         if (r.on)
@@ -3922,7 +4549,23 @@ static bool openPanel(UObject* clone)
                                     float m[4] = {0, 0, 74, 0};
                                     callBytes(band, L"SetPadding", m, 16, "panel.optBand");
                                 }
-                                slotAlign(addChildTo(rowBox, band, "panel.optBand"), 0, 0, "panel.optBand");
+                                {   // v0.40(pad): 선택 테두리
+                                    UObject* selOut = spawn(bCls, "panel.optBand");
+                                    if (selOut)
+                                    {
+                                        if (texSelFrame) callBytes(selOut, L"SetBrushFromTexture", &texSelFrame, 8, "panel.optBand");
+            setBrushColor(selOut, {0.95f, 0.92f, 0.80f, 0.0f}, "panel.optBand");
+                                        setVisibility(selOut, 4, "panel.optBand");
+                                        float sm[4] = {3, 3, 3, 3};
+                                        callBytes(selOut, L"SetPadding", sm, 16, "panel.optBand");
+                                        slotAlign(addChildTo(rowBox, selOut, "panel.optBand"), 0, 0, "panel.optBand");
+                                        slotAlign(addChildTo(selOut, band, "panel.optBand"), 0, 0, "panel.optBand");
+                                    }
+                                    else slotAlign(addChildTo(rowBox, band, "panel.optBand"), 0, 0, "panel.optBand");
+                                    g_lastRowOutline = selOut;
+                                    g_lastRowBox = rowBox;
+                                    navAdd(NAVK_OPT, g_plgN, oi);
+                                }
                                 UObject* hbO = spawn(hCls, "panel.optHb");
                                 if (!hbO) break;
                                 setVisibility(hbO, 4, "panel.optHb");
@@ -3948,7 +4591,7 @@ static bool openPanel(UObject* clone)
                                 {
                                     // v0.29: 실행 버튼 -- 값은 '누른 횟수'. 모드가
                                     // 값 증가를 보고 한 번 일하고 끝낸다.
-                                    makeButton(hbO, o.btnCap[0] ? o.btnCap : L"실행", &o.comboHs);
+                                    makeButton(hbO, o.btnCap[0] ? o.btnCap : TR(L"실행", L"Run"), &o.comboHs);
                                 }
                                 else if (o.type == 6)
                                 {
@@ -4052,12 +4695,28 @@ static bool openPanel(UObject* clone)
                                         float m[4] = {0, 0, 74, 0};
                                         callBytes(band, L"SetPadding", m, 16, "panel.foldBand");
                                     }
-                                    slotAlign(addChildTo(rowBox, band, "panel.foldBand"), 0, 0, "panel.foldBand");
+                                    {   // v0.40(pad): 선택 테두리
+                                        UObject* selOut = spawn(bCls, "panel.foldBand");
+                                        if (selOut)
+                                        {
+                                            if (texSelFrame) callBytes(selOut, L"SetBrushFromTexture", &texSelFrame, 8, "panel.foldBand");
+            setBrushColor(selOut, {0.95f, 0.92f, 0.80f, 0.0f}, "panel.foldBand");
+                                            setVisibility(selOut, 4, "panel.foldBand");
+                                            float sm[4] = {3, 3, 3, 3};
+                                            callBytes(selOut, L"SetPadding", sm, 16, "panel.foldBand");
+                                            slotAlign(addChildTo(rowBox, selOut, "panel.foldBand"), 0, 0, "panel.foldBand");
+                                            slotAlign(addChildTo(selOut, band, "panel.foldBand"), 0, 0, "panel.foldBand");
+                                        }
+                                        else slotAlign(addChildTo(rowBox, band, "panel.foldBand"), 0, 0, "panel.foldBand");
+                                        g_lastRowOutline = selOut;
+                                        g_lastRowBox = rowBox;
+                                        navAdd(NAVK_FOLD, g_plgN, -1);
+                                    }
                                     wchar_t cap[64];
                                     if (folded)
-                                        swprintf(cap, 64, L"펼치기 ▼   (옵션 %d개 더)", visTotal - FOLD_SHOW);
+                                        swprintf(cap, 64, TR(L"펼치기 ▼   (옵션 %d개 더)", L"Expand ▼   (%d more options)"), visTotal - FOLD_SHOW);
                                     else
-                                        lstrcpynW(cap, L"접기 ▲", 64);
+                                        lstrcpynW(cap, TR(L"접기 ▲", L"Collapse ▲"), 64);
                                     setTextOn(ftxt, cap, "panel.foldTxt");
                                     setTextColor(ftxt, {0.70f, 0.74f, 0.78f, 1.0f}, "panel.foldTxt");
                                     applyFontScaled(ftxt, 0.8f);
@@ -4076,7 +4735,7 @@ static bool openPanel(UObject* clone)
                     else if (UObject* st = spawn(tCls, "panel.modState"))  // 폴백: v0.5 상태 텍스트
                     {
                         setVisibility(st, 4, "panel.modState");
-                        setTextOn(st, ents[k].pak ? L"pak 모드 인식됨" : (luaMod ? L"Lua 모드 인식됨" : L"C++ 모드 인식됨"), "panel.modState");
+                        setTextOn(st, ents[k].pak ? TR(L"pak 모드 인식됨", L"pak mod detected") : (luaMod ? TR(L"Lua 모드 인식됨", L"Lua mod detected") : TR(L"C++ 모드 인식됨", L"C++ mod detected")), "panel.modState");
                         setTextColor(st, {0.52f, 0.57f, 0.62f, 1.0f}, "panel.modState");
                         applyFontScaled(st, 0.8f);
                         slotAlign(addChildTo(hb2, st, "panel.modState"), -1, 2, "panel.modState");
@@ -4090,7 +4749,8 @@ static bool openPanel(UObject* clone)
             if (UObject* empty = spawn(tCls, "panel.empty"))
             {
                 setVisibility(empty, 4, "panel.empty");
-                setTextOn(empty, L"plugins 폴더에 모드 폴더를 넣으면 여기에 표시됩니다.  (모드폴더\\Scripts\\main.lua 또는 모드폴더\\dlls\\main.dll)", "panel.empty");
+                setTextOn(empty, TR(L"plugins 폴더에 모드 폴더를 넣으면 여기에 표시됩니다.  (모드폴더\\Scripts\\main.lua 또는 모드폴더\\dlls\\main.dll)",
+                              L"Put mod folders into the plugins folder and they appear here.  (ModFolder\\Scripts\\main.lua or ModFolder\\dlls\\main.dll)"), "panel.empty");
                 setTextColor(empty, {0.52f, 0.57f, 0.62f, 1.0f}, "panel.empty");
                 applyFontScaled(empty, 0.8f);
                 slotPad(addChildTo(vbC, empty, "panel.empty"), 8, 20, 0, 0, "panel.empty");
@@ -4104,11 +4764,12 @@ static bool openPanel(UObject* clone)
         // 모드 행을 누른 채 끌면 실시간 재배열, 놓으면 dsorder.txt 저장.
         // 위젯 행(밴드/라벨)은 고정 슬롯이고 드래그는 내용(name/label)만 옮긴다 --
         // 위젯 재부착 없이 setTextOn 재페인트라 레이아웃/포인터 수명 문제가 없다.
-        addSection(L"모드 순서", "panel.secOrd");
+        addSection(TR(L"모드 순서", L"Mod order"), "panel.secOrd");
         if (UObject* tip = spawn(tCls, "panel.ordTip"))
         {
             setVisibility(tip, 4, "panel.ordTip");
-            setTextOn(tip, L"행을 누른 채 위아래로 끌면 순서가 바뀌고, 놓으면 저장됩니다.", "panel.ordTip");
+            setTextOn(tip, TR(L"행을 누른 채 위아래로 끌면 순서가 바뀌고, 놓으면 저장됩니다.",
+                              L"Hold a row and drag up or down to reorder; release to save."), "panel.ordTip");
             setTextColor(tip, {0.52f, 0.57f, 0.62f, 1.0f}, "panel.ordTip");
             applyFontScaled(tip, 0.8f);
             slotPad(addChildTo(vbC, tip, "panel.ordTip"), 8, 16, 0, 0, "panel.ordTip");
@@ -4131,7 +4792,7 @@ static bool openPanel(UObject* clone)
                 if (!ini.empty())
                 {
                     if (ini.size() >= 3 && ini.compare(0, 3, "\xEF\xBB\xBF") == 0) ini.erase(0, 3);
-                    std::string nm = iniValue(ini, "plugin", "name");
+                    std::string nm = iniValueLang(ini, "plugin", "name");
                     if (!nm.empty()) utf8ToW(nm, orow.label, 64);
                 }
             }
@@ -4150,7 +4811,23 @@ static bool openPanel(UObject* clone)
                 float m[4] = {0, 0, 74, 0};
                 callBytes(band, L"SetPadding", m, 16, "panel.ordBand");
             }
-            slotAlign(addChildTo(rowBox, band, "panel.ordBand"), 0, 0, "panel.ordBand");
+            {   // v0.40(pad): 선택 테두리
+                UObject* selOut = spawn(bCls, "panel.ordBand");
+                if (selOut)
+                {
+                    if (texSelFrame) callBytes(selOut, L"SetBrushFromTexture", &texSelFrame, 8, "panel.ordBand");
+            setBrushColor(selOut, {0.95f, 0.92f, 0.80f, 0.0f}, "panel.ordBand");
+                    setVisibility(selOut, 4, "panel.ordBand");
+                    float sm[4] = {3, 3, 3, 3};
+                    callBytes(selOut, L"SetPadding", sm, 16, "panel.ordBand");
+                    slotAlign(addChildTo(rowBox, selOut, "panel.ordBand"), 0, 0, "panel.ordBand");
+                    slotAlign(addChildTo(selOut, band, "panel.ordBand"), 0, 0, "panel.ordBand");
+                }
+                else slotAlign(addChildTo(rowBox, band, "panel.ordBand"), 0, 0, "panel.ordBand");
+                g_lastRowOutline = selOut;
+                g_lastRowBox = rowBox;
+                navAdd(NAVK_ORD, g_ordN, -1);
+            }
             UObject* hbO = spawn(hCls, "panel.ordHb");
             if (!hbO) break;
             setVisibility(hbO, 4, "panel.ordHb");
@@ -4177,6 +4854,19 @@ static bool openPanel(UObject* clone)
                 slotFillWidth(ls, "panel.ordLbl");
                 orow.text = lbl;
             }
+            {   // v0.40: 모드 종류 (Lua / C++ / pak) -- 행 우측단 (실측 mod2.png)
+                const wchar_t* kindTxt = ents[k].pak ? L"pak" : (ents[k].cpp ? L"C++" : L"Lua");
+                if (UObject* kt = spawn(tCls, "panel.ordKind"))
+                {
+                    setVisibility(kt, 4, "panel.ordKind");
+                    setTextOn(kt, kindTxt, "panel.ordKind");
+                    setTextColor(kt, {0.52f, 0.57f, 0.62f, 1.0f}, "panel.ordKind");
+                    applyFontScaled(kt, 0.8f);
+                    UObject* ks = addChildTo(hbO, kt, "panel.ordKind");
+                    slotAlign(ks, -1, 2, "panel.ordKind");
+                    slotPad(ks, 0, 0, 40, 0, "panel.ordKind");
+                }
+            }
             orow.band = band;
             UObject* s = addChildTo(vbC, rowBox, "panel.ordRow");
             slotAlign(s, 0, -1, "panel.ordRow");
@@ -4188,7 +4878,8 @@ static bool openPanel(UObject* clone)
             if (UObject* empty = spawn(tCls, "panel.ordEmpty"))
             {
                 setVisibility(empty, 4, "panel.ordEmpty");
-                setTextOn(empty, L"정렬할 모드가 없습니다. plugins 폴더에 모드를 넣으면 여기서 순서를 정할 수 있습니다.", "panel.ordEmpty");
+                setTextOn(empty, TR(L"정렬할 모드가 없습니다. plugins 폴더에 모드를 넣으면 여기서 순서를 정할 수 있습니다.",
+                                L"Nothing to sort. Put mods into the plugins folder and order them here."), "panel.ordEmpty");
                 setTextColor(empty, {0.52f, 0.57f, 0.62f, 1.0f}, "panel.ordEmpty");
                 applyFontScaled(empty, 0.8f);
                 slotPad(addChildTo(vbC, empty, "panel.ordEmpty"), 8, 20, 0, 0, "panel.ordEmpty");
@@ -4211,13 +4902,44 @@ static bool openPanel(UObject* clone)
             slotAlign(cs, -1, 2, "panel.credit");
             slotFillWidth(cs, "panel.credit");  // 좌측 붙임 + 남은 폭 차지 -> 힌트가 우측 끝으로
         }
-        if (UObject* hint = spawn(tCls, "panel.hint"))
+        // v0.40: 우측 = 패드 힌트 (아이콘 + 글자). 패드를 쓸 때만 보인다.
+        // (ESC/버전 문구는 사용자 요청으로 제거 -- 버전은 [기본] 탭 '모드 버전' 행에 있다)
+        if (UObject* ph = spawn(hCls, "panel.padHint"))
         {
-            setVisibility(hint, 4, "panel.hint");
-            setTextOn(hint, L"ESC 또는 X 로 닫기  ·  DsCppModManager v0.28", "panel.hint");
-            setTextColor(hint, {0.52f, 0.57f, 0.62f, 1.0f}, "panel.hint");
-            applyFontScaled(hint, 0.8f);
-            slotAlign(addChildTo(bottom, hint, "panel.hint"), -1, 2, "panel.hint");
+            setVisibility(ph, g_inputMode.load(std::memory_order_relaxed) == 1 ? 4 : 1, "panel.padHint");
+            auto hintIcon = [&](const wchar_t* texName, const wchar_t* cap) {
+                UObject* ib = spawn(sCls, "panel.phIco");
+                if (ib)
+                {
+                    float iw = 40.0f, ih = 40.0f;
+                    callBytes(ib, L"SetWidthOverride", &iw, 4, "panel.phIco");
+                    callBytes(ib, L"SetHeightOverride", &ih, 4, "panel.phIco");
+                    setVisibility(ib, 4, "panel.phIco");
+                    UObject* htex = importTex(texName, "panel.phIco");
+                    if (UObject* im2 = spawn(bCls, "panel.phIcoB"))
+                    {
+                        if (htex) callBytes(im2, L"SetBrushFromTexture", &htex, 8, "panel.phIcoB");
+                        setBrushColor(im2, {1, 1, 1, 1}, "panel.phIcoB");
+                        setVisibility(im2, 4, "panel.phIcoB");
+                        slotAlign(addChildTo(ib, im2, "panel.phIco"), 0, 0, "panel.phIco");
+                    }
+                    UObject* is2 = addChildTo(ph, ib, "panel.phIco");
+                    slotAlign(is2, -1, 2, "panel.phIco");
+                    slotPad(is2, 26, 0, 8, 0, "panel.phIco");
+                }
+                if (UObject* tx = spawn(tCls, "panel.phTxt"))
+                {
+                    setVisibility(tx, 4, "panel.phTxt");
+                    setTextOn(tx, cap, "panel.phTxt");
+                    setTextColor(tx, {0.85f, 0.88f, 0.90f, 1.0f}, "panel.phTxt");
+                    applyFontScaled(tx, 0.8f);
+                    slotAlign(addChildTo(ph, tx, "panel.phTxt"), -1, 2, "panel.phTxt");
+                }
+            };
+            hintIcon(L"pad_a.png", TR(L"선택", L"Select"));
+            hintIcon(L"pad_b.png", TR(L"닫기", L"Close"));
+            slotAlign(addChildTo(bottom, ph, "panel.padHint"), -1, 2, "panel.padHint");
+            g_padHintBox = ph;
         }
         UObject* s = addChildTo(vb, bottom, "panel.bottom");
         slotAlign(s, 0, -1, "panel.bottom");
@@ -4225,11 +4947,16 @@ static bool openPanel(UObject* clone)
     }
 
     // 표시: 호스트는 0(클릭 감시자 있음 -- 우리 펌프), 뷰포트 ZOrder 1000
+    panelInputMode(true);   // v0.40: 게임(메뉴)의 패드 처리 차단 -- '나가기' 오발 방지
+    g_restoreInputPending = false;   // 다시 열렸으면 지연 복구는 무효
+    g_restoreWaitDir = false;
     setVisibility(host, 0, "panel.host");
     int z = 1000;
     if (!callBytes(host, L"AddToViewport", &z, 4, "panel.viewport"))
     {
         logf("FAIL panel: AddToViewport 실패 -- 고아 호스트는 GC 에 맡김");
+        g_restoreInputPending = true;    // 위에서 건 UIOnly 가 동결로 남지 않게(리뷰)
+        g_restoreWaitDir = false;
         for (int i = 0; i < 3; ++i) g_hsX[i] = nullptr;
         for (int i = 0; i < 3; ++i) g_hsBtn[i] = nullptr;
         g_plgN = 0;
@@ -4286,7 +5013,8 @@ static void closePopup(const char* why)
 static bool showRestartPopup(const wchar_t* desc = nullptr)
 {
     if (g_popupOpen) return true;
-    const wchar_t* descText = desc ? desc : L"모드 적용을 위해 게임 재시작이 필요합니다.";
+    const wchar_t* descText = desc ? desc : TR(L"모드 적용을 위해 게임 재시작이 필요합니다.",
+                                               L"A game restart is needed to apply the mod.");
     // v0.25: 띄운 문구를 그대로 로그에 남긴다 -- 사용자가 팝업을 닫아 버려도
     // 무슨 일이 있었는지 cppmm_log.txt 만 보면 재구성된다.
     logf("popup 요청: \"%s\"", u8(descText).c_str());
@@ -4316,7 +5044,7 @@ static bool showRestartPopup(const wchar_t* desc = nullptr)
         {
             UObject* tt = readObjProp(pop, L"TitleText", "popup");
             UObject* dt = readObjProp(pop, L"DescriptionText", "popup");
-            if (tt) setTextOn(tt, L"모드 매니저", "popup.title");
+            if (tt) setTextOn(tt, TR(L"모드 매니저", L"ModManager"), "popup.title");
             if (dt)
             {
                 setTextOn(dt, descText, "popup.desc");
@@ -4345,7 +5073,7 @@ static bool showRestartPopup(const wchar_t* desc = nullptr)
             if ((ok || xb) && callBytes(pop, L"AddToViewport", &z, 4, "popup.viewport"))
             {
                 // Construct 가 텍스트를 되돌릴 수 있다 (메뉴 클론 실측 규약) -- 후처리 재설정
-                if (tt) setTextOn(tt, L"모드 매니저", "popup.title2");
+                if (tt) setTextOn(tt, TR(L"모드 매니저", L"ModManager"), "popup.title2");
                 if (dt) setTextOn(dt, descText, "popup.desc2");
                 g_popup = (void*)pop;
                 g_hsPop[0] = ok;
@@ -4441,7 +5169,7 @@ static bool showRestartPopup(const wchar_t* desc = nullptr)
     if (UObject* t = spawn2(tCls))
     {
         setVisibility(t, 4, "popup.t");
-        setTextOn(t, L"모드 매니저", "popup.t");
+        setTextOn(t, TR(L"모드 매니저", L"ModManager"), "popup.t");
         setTextColor(t, {0.97f, 0.97f, 0.98f, 1.0f}, "popup.t");
         pfont(t, 1.05f);
         addChildTo(pvb, t, "popup.t");
@@ -4495,7 +5223,7 @@ static bool showRestartPopup(const wchar_t* desc = nullptr)
             callBytes(outline, L"SetPadding", m, 16, "popup.ok");
             setBrushColor(fill, {0.010f, 0.014f, 0.016f, 0.55f}, "popup.ok");
             setVisibility(fill, 4, "popup.ok");
-            setTextOn(bt, L"확인", "popup.ok");
+            setTextOn(bt, TR(L"확인", L"OK"), "popup.ok");
             setTextColor(bt, {0.97f, 0.97f, 0.98f, 1.0f}, "popup.ok");
             pfont(bt, 0.9f);
             setVisibility(bt, 4, "popup.ok");
@@ -4565,6 +5293,7 @@ static void closeCombo(const char* why)
     g_comboOpen = false;
     g_comboN = 0;
     g_comboHover = -1;
+    g_comboPadSel = -1;   // v0.40(pad)
     g_comboRow = -1;
     g_comboOpt = 0;
     g_comboValTx = nullptr;
@@ -5178,7 +5907,8 @@ static bool openColorPicker(UObject* anchor, int startRgb, int row, int opt)
     if (UObject* tip = spawn(tCls))
     {
         setVisibility(tip, 4, "color.tip");
-        setTextOn(tip, L"0-9 A-F 로 직접 입력  ·  Backspace 지우기  ·  ESC 닫기", "color.tip");
+        setTextOn(tip, TR(L"0-9 A-F 로 직접 입력  ·  Backspace 지우기  ·  ESC 닫기",
+                          L"Type 0-9 A-F directly  ·  Backspace to erase  ·  ESC to close"), "color.tip");
         setTextColor(tip, {0.52f, 0.57f, 0.62f, 1.0f}, "color.tip");
         applyBorrowedFont(tip, 0.7f);
         UObject* s = addChildTo(vb, tip, "color.tip");
@@ -5261,12 +5991,10 @@ static void checkModNotifications(ULONGLONG now)
         if (msgA.size() >= 3 && msgA.compare(0, 3, "\xEF\xBB\xBF") == 0) msgA.erase(0, 3);
         while (!msgA.empty() && (msgA.back() == '\n' || msgA.back() == '\r' || msgA.back() == ' '))
             msgA.pop_back();
-        static wchar_t msgW[160];
-        if (msgA.empty() || _stricmp(msgA.c_str(), "restart") == 0)
+        // 표시명(dsplugin.ini name=) -- 기본 문구와 발신자 표기 양쪽에 쓴다
+        wchar_t disp[64];
+        disp[0] = 0;
         {
-            // 기본 문구: 매니페스트 표시명으로 어떤 모드인지 알려준다
-            wchar_t disp[64];
-            disp[0] = 0;
             wchar_t ini[MAX_PATH * 2];
             pluginSrcPath(ini, relPath);
             lstrcatW(ini, L"\\dsplugin.ini");
@@ -5274,21 +6002,422 @@ static void checkModNotifications(ULONGLONG now)
             if (!d.empty())
             {
                 if (d.size() >= 3 && d.compare(0, 3, "\xEF\xBB\xBF") == 0) d.erase(0, 3);
-                std::string nm = iniValue(d, "plugin", "name");
+                std::string nm = iniValueLang(d, "plugin", "name");
                 if (!nm.empty()) utf8ToW(nm, disp, 64);
             }
-            swprintf(msgW, 160, L"『%s』 변경 사항은 게임 재시작 후 적용됩니다.",
+        }
+        static wchar_t msgW[240];
+        if (msgA.empty() || _stricmp(msgA.c_str(), "restart") == 0)
+        {
+            swprintf(msgW, 240, TR(L"『%s』 변경 사항은 게임 재시작 후 적용됩니다.",
+                               L"Changes to '%s' take effect after the game restarts."),
                      disp[0] ? disp : ents[k].name);
         }
         else
         {
-            if (msgA.size() > 240) msgA.resize(240);
-            utf8ToW(msgA, msgW, 160);
+            // v0.40: 발신자를 밝힌다 -- 발신자 없는 문구는 매니저/게임의 말처럼
+            // 읽힌다 (실측 2026-08-10: AutoFood 의 "게임이 업데이트되어..." 를
+            // 매니저/게임 탓으로 오인). 모드가 보낸 문구 앞에 이름을 붙인다.
+            if (msgA.size() > 200) msgA.resize(200);
+            wchar_t body[160];
+            utf8ToW(msgA, body, 160);
+            swprintf(msgW, 240, TR(L"『%s』 모드의 안내:\n%s", L"From mod '%s':\n%s"),
+                     disp[0] ? disp : ents[k].name, body);
         }
         logf("notify: '%s' 재시작 안내 신호 수신", u8(ents[k].name).c_str());
         showRestartPopup(msgW);
         return;  // 한 번에 하나 -- 다음 신호는 다음 스캔에서
     }
+}
+
+// ---------------- v0.40: 재구축 = "새로 그린 뒤 옛것 제거" ----------------
+// closePanel -> openPanel 순서는 옛 패널이 사라진 뒤 새 패널이 완성될 때까지
+// (openPanel 이 무겁다) 화면이 1초쯤 비었다(실측 보고). 옛 패널을 산 채로 두고
+// 새 패널을 위에 얹은 다음 걷어내면 공백이 없다.
+static void rebuildPanel(UObject* clone, const char* why, bool keepScroll = true)
+{
+    if (keepScroll) captureScroll();
+    UObject* oldHost = reinterpret_cast<UObject*>(g_panel);
+    g_panel = nullptr;               // closePanel 이 옛 패널을 지우지 않게
+    closePanel(why);                 // 상태 청소 (콤보/색상/팝업 연쇄 닫기 포함)
+    openPanel(clone);                // 새 패널이 옛 패널 위에 얹힌다
+    if (oldHost)
+    {
+        UFunction* fn = fnOf(oldHost, L"RemoveFromParent", "rebuild.old");
+        if (fn && (int)fn->GetParmsSize() == 0)
+        {
+            PB pb;
+            if (!peGuard(oldHost, fn, pb.b)) logf("WARN rebuild: 옛 패널 제거 SEH");
+        }
+    }
+}
+
+// ---------------- v0.40(pad): 패널 내비게이션 ----------------
+static void navPaintSel(int oldSel, int newSel)
+{
+    if (oldSel >= 0 && oldSel < g_navN && g_nav[oldSel].outline)
+        setBrushColor(reinterpret_cast<UObject*>(g_nav[oldSel].outline),
+                      {1, 1, 1, 0}, "nav-sel");
+    // 켜는 쪽은 패드 모드에서만 -- 키/마 사용 중엔 패드 선택 표시를 숨긴다 (설정창 실측)
+    if (newSel >= 0 && newSel < g_navN && g_nav[newSel].outline &&
+        g_inputMode.load(std::memory_order_relaxed) == 1)
+        setBrushColor(reinterpret_cast<UObject*>(g_nav[newSel].outline),
+                      {1, 1, 1, 1}, "nav-sel");
+}
+
+static void navEnsureVisible(int sel)
+{
+    if (g_pendScroll >= 0.0f) return;   // v0.40: 복원이 진행 중이면 양보
+    if (sel < 0 || sel >= g_navN || !g_nav[sel].rowBox || !g_scrollBox) return;
+    double rx0, ry0, rx1, ry1, sx0, sy0, sx1, sy1;
+    if (!widgetRectAbs(reinterpret_cast<UObject*>(g_nav[sel].rowBox), &rx0, &ry0, &rx1, &ry1)) return;
+    if (!widgetRectAbs(reinterpret_cast<UObject*>(g_scrollBox), &sx0, &sy0, &sx1, &sy1)) return;
+    float cur = readScrollOffset(g_scrollBox);
+    if (cur < 0) cur = 0;
+    float want = cur;
+    if (ry0 < sy0) want = cur - (float)(sy0 - ry0) - 20.0f;
+    else if (ry1 > sy1) want = cur + (float)(ry1 - sy1) + 20.0f;
+    if (want < 0) want = 0;
+    if (want != cur) writeScrollOffset(g_scrollBox, want);
+}
+
+static void navAfterRebuild()
+{
+    if (g_navSel >= g_navN) g_navSel = g_navN - 1;
+    navPaintSel(-1, g_navSel);
+    // v0.40: 스크롤 따라가기는 패드 모드에서만 -- 마우스 재구축은 복원(g_pendScroll)
+    // 이 자리를 지키는데, 여기서 또 스크롤하면 복원과 싸운다
+    if (g_inputMode.load(std::memory_order_relaxed) == 1) navEnsureVisible(g_navSel);
+}
+
+// v0.40(pad): 드롭다운에서 패드 A 로 고른 항목 적용. true = 패널 재구축(틱 종료).
+static bool comboApplyIdx(int idx, UObject* clone)
+{
+    bool reopenAfter = false;
+    if (g_comboRow < 0)   // 언어 콤보 (매니저 자체)
+    {
+        int want = (idx == 1) ? 1 : 0;
+        if (want != g_lang)
+        {
+            applyLang(want);
+            saveLang();
+            logf("lang: 사용자 선택(패드) -> %s", g_lang ? "en" : "ko");
+            setLabel(clone, "lang");
+            reopenAfter = true;
+        }
+    }
+    else if (g_comboRow >= 0 && g_comboRow < g_plgN)
+    {
+        PlgRow& r = g_plg[g_comboRow];
+        if (g_comboOpt >= 0 && g_comboOpt < r.optN)
+        {
+            PlgOpt& o = r.opt[g_comboOpt];
+            if (idx >= 0 && idx < o.choiceN && o.val != idx)
+            {
+                o.val = idx;
+                if (g_comboValTx)
+                    setTextOn(reinterpret_cast<UObject*>(g_comboValTx), o.choices[idx], "pad-combo");
+                saveOptionValues(r);
+                if (optHasChildren(r, g_comboOpt)) reopenAfter = true;
+                logf("combo(패드): '%s' %s = %d", u8(r.name).c_str(), o.key, idx);
+            }
+        }
+    }
+    closeCombo("선택(패드)");
+    if (reopenAfter)
+    {
+        rebuildPanel(clone, "옵션 갱신(콤보)");
+        navAfterRebuild();
+        return true;
+    }
+    return false;
+}
+
+// 패널 열림 중 패드 입력 소비. true = 패널을 재구축했다(이번 틱 종료).
+// 규약: 마우스와 별개 경로다 -- 무장(눌렀다 떼기)을 흉내내지 않고 즉시 실행한다.
+static bool padPanelInput(unsigned pe, UObject* clone)
+{
+    if (pe & (PAD_LB | PAD_RB))   // 탭 전환 (게임 설정창과 동일)
+    {
+        int want = (pe & PAD_LB) ? 0 : 1;
+        if (want != g_activeTab)
+        {
+            if (g_padOrdLift >= 0)   // 집어든 이동은 저장하고 탭을 바꾼다
+            {
+                g_padOrdLift = -1;
+                saveOrderFile();
+                logf("pad: 순서 저장(탭 전환)");
+            }
+            g_activeTab = want;
+            g_padOrdLift = -1;
+            logf("pad: 탭 전환 -> %s", want == 0 ? "모드" : "순서");
+            rebuildPanel(clone, "패드 탭 전환", false);
+            navAfterRebuild();
+            return true;
+        }
+    }
+    if (g_navN <= 0) return false;
+    if (pe & (PAD_UP | PAD_DOWN))
+    {
+        int dir = (pe & PAD_DOWN) ? 1 : -1;
+        // 순서 탭에서 집어든 상태: 위/아래 = 이웃 행과 자리 교환
+        if (g_activeTab == 1 && g_padOrdLift >= 0 && g_padOrdLift < g_ordN)
+        {
+            int a = g_padOrdLift, b2 = a + dir;
+            if (b2 >= 0 && b2 < g_ordN)
+            {
+                wchar_t tn[64], tl[64];
+                lstrcpynW(tn, g_ord[a].name, 64);
+                lstrcpynW(tl, g_ord[a].label, 64);
+                lstrcpynW(g_ord[a].name, g_ord[b2].name, 64);
+                lstrcpynW(g_ord[a].label, g_ord[b2].label, 64);
+                lstrcpynW(g_ord[b2].name, tn, 64);
+                lstrcpynW(g_ord[b2].label, tl, 64);
+                if (g_ord[a].text)
+                    setTextOn(reinterpret_cast<UObject*>(g_ord[a].text), g_ord[a].label, "pad-ord");
+                if (g_ord[b2].text)
+                    setTextOn(reinterpret_cast<UObject*>(g_ord[b2].text), g_ord[b2].label, "pad-ord");
+                if (g_ord[a].band)
+                    setBrushColor(reinterpret_cast<UObject*>(g_ord[a].band), {1, 1, 1, 0.07f}, "pad-ord");
+                if (g_ord[b2].band)
+                    setBrushColor(reinterpret_cast<UObject*>(g_ord[b2].band), {1, 1, 1, 0.20f}, "pad-ord");
+                g_padOrdLift = b2;
+                // 선택 테두리도 그 행으로
+                int oldSel = g_navSel;
+                for (int i = 0; i < g_navN; ++i)
+                    if (g_nav[i].kind == NAVK_ORD && g_nav[i].row == b2) { g_navSel = i; break; }
+                navPaintSel(oldSel, g_navSel);
+                navEnsureVisible(g_navSel);
+            }
+            return false;
+        }
+        int oldSel = g_navSel;
+        int ns = (g_navSel < 0) ? (dir > 0 ? 0 : g_navN - 1) : g_navSel + dir;
+        if (ns < 0) ns = 0;
+        if (ns >= g_navN) ns = g_navN - 1;
+        g_navSel = ns;
+        navPaintSel(oldSel, ns);
+        navEnsureVisible(ns);
+        return false;
+    }
+    if (g_navSel < 0 || g_navSel >= g_navN) return false;
+    NavItem& nv = g_nav[g_navSel];
+    int dir = (pe & PAD_RIGHT) ? 1 : ((pe & PAD_LEFT) ? -1 : 0);
+    bool act = (pe & PAD_A) != 0;
+    if (!dir && !act) return false;
+
+    if (nv.kind == NAVK_FOLDER)
+    {
+        if (act) openPluginsFolder();
+        return false;
+    }
+    if (nv.kind == NAVK_LANG)
+    {
+        if (act)   // A = 드롭다운 열기 (게임 설정창과 동일)
+        {
+            if (openCombo(reinterpret_cast<UObject*>(g_langHs), g_langChoices, 2,
+                          (g_lang == 1) ? 1 : 0, -1, -1, g_langTx))
+            {
+                g_comboPadSel = (g_lang == 1) ? 1 : 0;
+                paintComboItem(g_comboPadSel, true);
+            }
+            return false;
+        }
+        int want = (dir > 0 ? 1 : 0);
+        if (want != g_lang)
+        {
+            applyLang(want);
+            saveLang();
+            logf("pad: 언어 -> %s", g_lang ? "en" : "ko");
+            setLabel(clone, "lang");
+            rebuildPanel(clone, "언어 변경(패드)");
+            navAfterRebuild();
+            return true;
+        }
+        return false;
+    }
+    if (nv.kind == NAVK_FOLD && nv.row >= 0 && nv.row < g_plgN)
+    {
+        if (act)
+        {
+            PlgRow& r = g_plg[nv.row];
+            setExpanded(r.name, !isExpanded(r.name));
+            rebuildPanel(clone, "펼치기(패드)");
+            navAfterRebuild();
+            return true;
+        }
+        return false;
+    }
+    if (nv.kind == NAVK_MOD && nv.row >= 0 && nv.row < g_plgN)
+    {
+        PlgRow& r = g_plg[nv.row];
+        bool want = act ? !r.on : (dir > 0);
+        if (want != r.on)
+        {
+            r.on = want;
+            paintToggle(r);
+            applyPluginState(r);
+            bool pop = r.on && !sessionLoaded(r.name);
+            if (r.optN)
+            {
+                rebuildPanel(clone, "모드 토글(패드)");
+                navAfterRebuild();
+                if (pop) showRestartPopup(nullptr);
+                return true;
+            }
+            if (pop) showRestartPopup(nullptr);
+        }
+        return false;
+    }
+    if (nv.kind == NAVK_ORD && nv.row >= 0 && nv.row < g_ordN)
+    {
+        if (act)   // A = 집기 / 놓기(저장)
+        {
+            if (g_padOrdLift == nv.row)
+            {
+                g_padOrdLift = -1;
+                if (g_ord[nv.row].band)
+                    setBrushColor(reinterpret_cast<UObject*>(g_ord[nv.row].band), {1, 1, 1, 0.07f}, "pad-ord");
+                saveOrderFile();
+                logf("pad: 순서 저장");
+            }
+            else
+            {
+                g_padOrdLift = nv.row;
+                if (g_ord[nv.row].band)
+                    setBrushColor(reinterpret_cast<UObject*>(g_ord[nv.row].band), {1, 1, 1, 0.20f}, "pad-ord");
+                logf("pad: '%s' 집음", u8(g_ord[nv.row].name).c_str());
+            }
+        }
+        return false;
+    }
+    if (nv.kind != NAVK_OPT || nv.row < 0 || nv.row >= g_plgN) return false;
+    PlgRow& r = g_plg[nv.row];
+    if (nv.opt < 0 || nv.opt >= r.optN) return false;
+    PlgOpt& o = r.opt[nv.opt];
+    if (o.type == 2)          // 키 지정: A = 캡처 시작
+    {
+        if (act)
+        {
+            g_keyCapture.store(true, std::memory_order_relaxed);
+            g_capturedVk.store(0, std::memory_order_relaxed);
+            g_keyCapRow = nv.row;
+            g_keyCapOpt = nv.opt;
+            if (o.comboTx)
+                setTextOn(reinterpret_cast<UObject*>(o.comboTx),
+                          TR(L"키를 누르세요  (Delete 해제 · ESC 취소)",
+                             L"Press a key  (Delete = clear · ESC = cancel)"), "pad.keycap");
+        }
+        return false;
+    }
+    if (o.type == 3)          // 색상: A = 선택창 열기
+    {
+        if (act) openColorPicker(reinterpret_cast<UObject*>(o.comboHs), o.val & 0xFFFFFF, nv.row, nv.opt);
+        return false;
+    }
+    if (o.type == 5)          // 실행 버튼
+    {
+        if (act)
+        {
+            o.val = (o.val < 0x7FFFFFF) ? o.val + 1 : 1;
+            saveOptionValues(r);
+            logf("pad: button '%s' %s -> %d", u8(r.name).c_str(), o.key, o.val);
+        }
+        return false;
+    }
+    if (o.choiceN >= 2)       // 콤보: A = 드롭다운 열기, 좌/우 = 열지 않고 순환
+    {
+        if (act)
+        {
+            int cur = (o.val >= 0 && o.val < o.choiceN) ? o.val : 0;
+            if (openCombo(reinterpret_cast<UObject*>(o.comboHs), o.choices, o.choiceN,
+                          cur, nv.row, nv.opt, o.comboTx))
+            {
+                g_comboPadSel = cur;
+                paintComboItem(cur, true);
+            }
+            return false;
+        }
+        int n = o.choiceN;
+        int nv2 = (o.val + dir + n) % n;
+        if (nv2 != o.val)
+        {
+            o.val = nv2;
+            if (o.comboTx)
+                setTextOn(reinterpret_cast<UObject*>(o.comboTx), o.choices[nv2], "pad-combo");
+            saveOptionValues(r);
+            if (optHasChildren(r, nv.opt))
+            {
+                rebuildPanel(clone, "옵션 갱신(패드)");
+                navAfterRebuild();
+                return true;
+            }
+        }
+        return false;
+    }
+    if (o.type == 0 || o.type == 4)   // 토글 / 체크박스
+    {
+        int want = act ? (o.val ? 0 : 1) : (dir > 0 ? 1 : 0);
+        if (want != o.val)
+        {
+            o.val = want;
+            saveOptionValues(r);
+            if (o.type == 4 || optHasChildren(r, nv.opt))
+            {   // 체크 그림은 텍스처 교체 = 재구축 (v0.29 규약)
+                rebuildPanel(clone, "옵션 갱신(패드)");
+                navAfterRebuild();
+                return true;
+            }
+            paintOpt(o);
+        }
+        return false;
+    }
+    if (o.type == 6)          // 슬라이더: 좌/우 = 범위의 1/20 씩 (최소 1)
+    {
+        if (!dir) return false;
+        int stepv = (o.maxV - o.minV) / 20;
+        if (stepv < 1) stepv = 1;
+        int nv2 = o.val + dir * stepv;
+        if (nv2 < o.minV) nv2 = o.minV;
+        if (nv2 > o.maxV) nv2 = o.maxV;
+        if (nv2 != o.val)
+        {
+            o.val = nv2;
+            paintSlider(o.sliderFill, o.sliderRest, o.valText, nv2, o.minV, o.maxV);
+            saveOptionValues(r);
+            if (optHasChildren(r, nv.opt))
+            {
+                rebuildPanel(clone, "옵션 갱신(패드)");
+                navAfterRebuild();
+                return true;
+            }
+        }
+        return false;
+    }
+    if (o.type == 1 && dir)   // 스테퍼
+    {
+        int nv2 = o.val + dir * o.step;
+        if (nv2 < o.minV) nv2 = o.minV;
+        if (nv2 > o.maxV) nv2 = o.maxV;
+        if (nv2 != o.val)
+        {
+            o.val = nv2;
+            if (o.valText)
+            {
+                wchar_t vbuf[16];
+                swprintf(vbuf, 16, L"%d", o.val);
+                setTextOn(reinterpret_cast<UObject*>(o.valText), vbuf, "pad-step");
+            }
+            saveOptionValues(r);
+            if (optHasChildren(r, nv.opt))
+            {
+                rebuildPanel(clone, "옵션 갱신(패드)");
+                navAfterRebuild();
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // ======================= v0.2: 33ms 게임스레드 펌프 ========================
@@ -5362,6 +6491,15 @@ static void pump(ULONGLONG now)
 
     if (g_popupOpen)  // 팝업이 최상위 모달
     {
+        {   // v0.40(pad): A = 확인. 그 외 패드 엣지는 버린다 -- 쌓아두면 팝업이
+            // 닫힌 뒤 묵은 엣지가 재생된다 (리뷰 확정: 켠 모드가 도로 꺼졌다)
+            unsigned pe = g_padEdges.exchange(0, std::memory_order_relaxed);
+            if (pe & PAD_A)
+            {
+                closePopup("확인(패드)");
+                return;
+            }
+        }
         // 복제 팝업의 BP 가 스스로 닫혔을 수 있다(자체 버튼 핸들러) -- 상태 동기화
         if (g_popup)
         {
@@ -5409,6 +6547,73 @@ static void pump(ULONGLONG now)
                 float cur = readScrollOffset(g_scrollBox);
                 if (cur >= g_pendScroll - 1.0f) g_pendScroll = -1.0f;  // 닿음(또는 최대치)
                 else writeScrollOffset(g_scrollBox, g_pendScroll);
+            }
+        }
+        // v0.40(pad): 장치 전환 표시 동기화 -- 패드 UI(칩·힌트·테두리)는 패드를
+        // 쓸 때만 보이고, 키/마 입력이 오면 즉시 사라진다 (게임 설정창 실측).
+        {
+            static int s_prevIm = -1;
+            int im = g_inputMode.load(std::memory_order_relaxed);
+            if (im != s_prevIm)
+            {
+                s_prevIm = im;
+                for (int c = 0; c < 2; ++c)
+                    if (g_chipBox[c])
+                        setVisibility(reinterpret_cast<UObject*>(g_chipBox[c]), im == 1 ? 4 : 2, "pad-chip");
+                if (g_padHintBox)
+                    setVisibility(reinterpret_cast<UObject*>(g_padHintBox), im == 1 ? 4 : 1, "pad-hint");
+                if (im == 1) navPaintSel(-1, g_navSel);
+                else
+                {
+                    navPaintSel(g_navSel, -1);
+                    if (g_comboPadSel >= 0) { paintComboItem(g_comboPadSel, false); g_comboPadSel = -1; }
+                }
+            }
+        }
+        // v0.40(pad): 패드 입력 소비. 항상 배출하고, 캡처/색상창/마우스 드래그 중이거나
+        // 신선도(400ms)를 넘긴 엣지는 **버린다**(묵은 엣지 재생 방지 -- 리뷰 확정).
+        // 드롭다운이 열려 있으면 **드롭다운 안**을 내비게이션한다 (메인과 동시 이동 금지).
+        {
+            unsigned pe = g_padEdges.exchange(0, std::memory_order_relaxed);
+            bool fresh = pe && now - g_padEdgeMs.load(std::memory_order_relaxed) < 400;
+            if (fresh && g_comboOpen)
+            {
+                if (pe & (PAD_UP | PAD_DOWN))
+                {
+                    int dir2 = (pe & PAD_DOWN) ? 1 : -1;
+                    int ns = (g_comboPadSel < 0) ? (dir2 > 0 ? 0 : g_comboN - 1) : g_comboPadSel + dir2;
+                    if (ns < 0) ns = 0;
+                    if (ns >= g_comboN) ns = g_comboN - 1;
+                    if (ns != g_comboPadSel)
+                    {
+                        paintComboItem(g_comboPadSel, false);
+                        g_comboPadSel = ns;
+                        paintComboItem(ns, true);
+                    }
+                }
+                else if ((pe & PAD_A) && g_comboPadSel >= 0 && g_comboPadSel < g_comboN)
+                {
+                    if (comboApplyIdx(g_comboPadSel, clone))
+                    {
+                        if (g_reflFault) cloneLost("패드 콤보 SEH");
+                        return;
+                    }
+                }
+                if (g_reflFault) { cloneLost("패드 콤보 SEH"); return; }
+            }
+            else if (fresh)
+            {
+                bool blocked = g_keyCapture.load(std::memory_order_relaxed) || g_colorOpen ||
+                               g_sldHs != nullptr || (g_activeTab == 1 && g_dragIdx >= 0);
+                if (!blocked)
+                {
+                    if (padPanelInput(pe, clone))
+                    {
+                        if (g_reflFault) cloneLost("패드 처리 SEH");
+                        return;
+                    }
+                    if (g_reflFault) { cloneLost("패드 처리 SEH"); return; }
+                }
             }
         }
         // v0.29: 슬라이더 드래그 -- 커서 X 를 값으로 바꿔 칸 폭/숫자를 곧바로 고친다.
@@ -5463,9 +6668,8 @@ static void pump(ULONGLONG now)
                 sliderRelease();
                 if (sldReopen)
                 {
-                    captureScroll();
-                    closePanel("슬라이더 자식 갱신");
-                    openPanel(clone);
+                    rebuildPanel(clone, "슬라이더 자식 갱신");
+                    navAfterRebuild();
                     if (g_reflFault) cloneLost("슬라이더 재구축 SEH");
                     return;
                 }
@@ -5476,7 +6680,19 @@ static void pump(ULONGLONG now)
         // 이 빌드의 Slate 는 좌클릭 드래그 스크롤을 주지 않아 직접 구현한다.
         if (g_dsBox)
         {
-            if (!g_lmbHeld.load(std::memory_order_relaxed)) { /* 놓임 -- 아래 뗌 처리에서 정리 */ }
+            if (!g_lmbHeld.load(std::memory_order_relaxed))
+            {
+                // v0.40: 뗌 엣지가 있으면 아래 뗌 처리가 정리한다. 그런데 배경에서
+                // 뗀 경우(전경 게이트가 엣지를 만들지 않음)나 엣지가 신선도(1200ms)를
+                // 넘겨 증발한 경우에는 그 처리가 영영 안 온다 -- 여기서 걷는다.
+                // (리뷰 확정: 스크롤바 고정, 콤보 바깥클릭 1회 먹힘, 복귀 클릭 때
+                //  묵은 g_dsStartY 로 목록이 순간이동)
+                if (!lmbUpEdge)
+                {
+                    clearArm();
+                    clearDragScroll();
+                }
+            }
             else
             {
                 sampleMouse();
@@ -5524,9 +6740,8 @@ static void pump(ULONGLONG now)
                              nv == 0 ? " (해제)" : "");
                     }
                 }
-                captureScroll();
-                closePanel("키 지정 갱신");
-                openPanel(clone);
+                rebuildPanel(clone, "키 지정 갱신");
+                navAfterRebuild();
                 if (g_reflFault) cloneLost("키 캡처 재구축 SEH");
                 return;
             }
@@ -5704,7 +6919,19 @@ static void pump(ULONGLONG now)
                     // 누른 항목 위에서 떼야 선택 (다른 항목으로 옮겨 떼면 취소)
                     if (armed >= 0 && armed == hov)
                     {
-                        if (g_comboRow >= 0 && g_comboRow < g_plgN)
+                        if (g_comboRow < 0)   // v0.40: 언어 콤보 (매니저 자체)
+                        {
+                            int want = (hov == 1) ? 1 : 0;
+                            if (want != g_lang)
+                            {
+                                applyLang(want);
+                                saveLang();
+                                logf("lang: 사용자 선택 -> %s", g_lang ? "en" : "ko");
+                                setLabel(clone, "lang");   // 타이틀 메뉴 항목 이름 갱신
+                                reopenAfter = true;        // 모든 라벨 갱신 = 패널 재구축
+                            }
+                        }
+                        else if (g_comboRow >= 0 && g_comboRow < g_plgN)
                         {
                             PlgRow& r = g_plg[g_comboRow];
                             if (g_comboOpt >= 0 && g_comboOpt < r.optN)
@@ -5728,9 +6955,8 @@ static void pump(ULONGLONG now)
                     else if (armed < 0 && hov < 0) closeCombo("바깥 클릭");
                     if (reopenAfter)
                     {
-                        captureScroll();  // v0.17: 보던 위치 사수
-                        closePanel("옵션 갱신(콤보)");
-                        openPanel(clone);
+                        rebuildPanel(clone, "옵션 갱신(콤보)");
+                        navAfterRebuild();
                     }
                 }
             }
@@ -5795,6 +7021,12 @@ static void pump(ULONGLONG now)
         }
         if (escEdge)
         {
+            if (g_padOrdLift >= 0)   // v0.40(pad): 집어든 이동을 버리지 않는다 (마우스 ESC 와 동일)
+            {
+                g_padOrdLift = -1;
+                saveOrderFile();
+                logf("pad: 순서 저장(닫기)");
+            }
             closePanel("ESC");
             return;
         }
@@ -5805,6 +7037,12 @@ static void pump(ULONGLONG now)
             {
                 if (g_hsX[i] && isHovered(reinterpret_cast<UObject*>(g_hsX[i]), "x-hs") == 1)
                 {
+                    if (g_padOrdLift >= 0)
+                    {
+                        g_padOrdLift = -1;
+                        saveOrderFile();
+                        logf("pad: 순서 저장(닫기)");
+                    }
                     closePanel("X 버튼");
                     return;
                 }
@@ -5817,9 +7055,10 @@ static void pump(ULONGLONG now)
                     if (g_activeTab != t)
                     {
                         g_activeTab = t;
+                        g_padOrdLift = -1;
                         logf("panel: 탭 전환 -> %s", t == 0 ? "모드" : "순서");
-                        closePanel("탭 전환");
-                        openPanel(clone);
+                        rebuildPanel(clone, "탭 전환", false);
+                        navAfterRebuild();
                     }
                     return;  // 탭 클릭 소비
                 }
@@ -5837,6 +7076,7 @@ static void pump(ULONGLONG now)
                         {
                             g_dragIdx = i;
                             g_dragMoved = false;
+                            g_padOrdLift = -1;   // v0.40(pad): 패드 집기와 동시 진행 금지
                             g_dragUpSnap = g_lmbUpMs.load(std::memory_order_relaxed);
                             setBrushColor(reinterpret_cast<UObject*>(g_ord[i].band),
                                           {1, 1, 1, 0.20f}, "ord-band");
@@ -5888,9 +7128,8 @@ static void pump(ULONGLONG now)
                 }
                 if (sldReopen)
                 {
-                    captureScroll();
-                    closePanel("슬라이더 자식 갱신");
-                    openPanel(clone);
+                    rebuildPanel(clone, "슬라이더 자식 갱신");
+                    navAfterRebuild();
                     if (g_reflFault) cloneLost("슬라이더 재구축 SEH");
                     return;
                 }
@@ -5904,6 +7143,13 @@ static void pump(ULONGLONG now)
                     g_armKind = ARM_FOLDER;
                     g_armHs = g_hsBtn[i];
                 }
+            }
+            if (g_armKind == ARM_NONE && g_langHs &&
+                isHovered(reinterpret_cast<UObject*>(g_langHs), "lang-cbo") == 1)
+            {
+                g_armKind = ARM_LANG;
+                g_armHs = g_langHs;
+                g_armRow = -1;
             }
             for (int i = 0; i < g_plgN && g_armKind == ARM_NONE; ++i)
             {
@@ -5988,6 +7234,10 @@ static void pump(ULONGLONG now)
             }
             if (g_scrollBox && g_lmbHeld.load(std::memory_order_relaxed))
             {   // 컨트롤 위든 빈 곳이든 드래그 스크롤은 항상 가능
+                // v0.40: 재구축 복원(g_pendScroll)이 진행 중이면 여기서 접는다 --
+                // 복원 루프가 매 틱 목표 오프셋을 다시 쓰면서 사용자의 드래그와
+                // 싸웠고, 손을 떼면 목표(때로 끝)까지 관성처럼 끌려갔다 (실측 보고).
+                g_pendScroll = -1.0f;
                 g_dsBox = g_scrollBox;
                 g_dsWhich = 0;
                 g_dsActive = false;
@@ -6013,6 +7263,12 @@ static void pump(ULONGLONG now)
             {
                 logf("panel: '폴더 바로가기' 클릭");
                 openPluginsFolder();  // 패널은 열린 채 유지
+            }
+            else if (onIt && kind == ARM_LANG)
+            {
+                // v0.40: 언어 콤보 -- g_comboRow = -1 이 매니저 자체 옵션 표식
+                openCombo(reinterpret_cast<UObject*>(g_langHs), g_langChoices, 2,
+                          (g_lang == 1) ? 1 : 0, -1, -1, g_langTx);
             }
             else if (onIt && row >= 0 && row < g_plgN)
             {
@@ -6057,7 +7313,8 @@ static void pump(ULONGLONG now)
                         g_keyCapOpt = oi;
                         if (o.comboTx)
                             setTextOn(reinterpret_cast<UObject*>(o.comboTx),
-                                      L"키를 누르세요  (Delete 해제 · ESC 취소)", "opt.keycap");
+                                      TR(L"키를 누르세요  (Delete 해제 · ESC 취소)",
+                                         L"Press a key  (Delete = clear · ESC = cancel)"), "opt.keycap");
                         logf("key: '%s' %s 캡처 시작", u8(r.name).c_str(), o.key);
                     }
                     else if (kind == ARM_COLOR_OPEN)
@@ -6118,9 +7375,8 @@ static void pump(ULONGLONG now)
             }
             if (needReopen)
             {
-                captureScroll();  // v0.17: 보던 위치 사수
-                closePanel("옵션 갱신");
-                openPanel(clone);
+                rebuildPanel(clone, "옵션 갱신");
+                navAfterRebuild();
             }
             if (needPopup) showRestartPopup();
         }
@@ -6129,6 +7385,38 @@ static void pump(ULONGLONG now)
         return;  // 패널 열림 중에는 메뉴 호버/클릭 처리 안 함 (스크림이 어차피 흡수)
     }
 
+    // v0.40: 라벨 키퍼 -- 게임 언어를 바꾸면 게임이 텍스트 바인딩을 다시 풀며
+    // 우리가 SetText 한 라벨을 지운다 (실측 2026-08-10: TitleMenuType=100 은 게임
+    // 문자열표에 없어 빈 값이 됐다. '나가기'는 렌더되므로 폰트 문제가 아니다).
+    // v0.40: 매 틱 SetText 는 FText 누수를 무한히 쌓는다(전사 규율 = FText 파괴
+    // 금지, 리뷰 확정 시간당 ~1800개). 라벨이 지워지는 사건은 게임 언어(문화)
+    // 전환뿐이므로, LanguageText 값이 실제로 바뀐 틱과 우리 언어가 바뀐 틱에만
+    // 다시 쓴다. strict=false = 실패해도 조용히(다음 전환 틱에 재시도).
+    static ULONGLONG s_lastLangKeepMs = 0;
+    static int s_lastLangText = -2;   // -2 = 아직 못 읽음
+    if (now - s_lastLangKeepMs > 150 && !g_panelOpen && !g_popupOpen && !g_comboOpen)
+    {   // v0.40 6차: 150ms -- 게임 언어 전환이 라벨을 지우는 공백을 한 프레임 수준으로.
+        // 파일 부담은 mtime 캐시가 막는다(변경 없으면 stat 한 번).
+        // (9차: ≈2초 내비 규칙 재주장 삭제 -- 메뉴는 포커스 구동이 아님이 확정)
+        s_lastLangKeepMs = now;
+        bool padActive = g_inputMode.load(std::memory_order_relaxed) == 1 &&
+                         g_padPresent.load(std::memory_order_relaxed);
+        static bool s_lastPadActive = false;
+        if (padActive != s_lastPadActive)
+        {   // 11b: 패드 사용 중에만 Y 아이콘 표시(가시성 토글 -- 위젯 재생성 없음).
+            s_lastPadActive = padActive;
+            if (g_padIcon)
+                setVisibility(reinterpret_cast<UObject*>(g_padIcon), padActive ? 4 : 1, "padico.tog");
+        }
+        int lt = readGameLangText();
+        bool cultureFlip = (lt >= 0 && s_lastLangText != -2 && lt != s_lastLangText);
+        bool langChanged = recheckLang(lt);
+        if (cultureFlip || langChanged || s_lastLangText == -2)
+            setLabel(clone, "keep", false);
+        if (lt >= 0) s_lastLangText = lt;
+        else if (s_lastLangText == -2) s_lastLangText = -1;   // 첫 틱 재주장은 1회만
+        if (g_reflFault) { cloneLost("라벨 키퍼 SEH"); return; }
+    }
     int h = isHoveredSlate(clone, "hover");  // 하이라이트는 Slate hover 와 동기
     if (h < 0 || g_reflFault)
     {
@@ -6147,6 +7435,395 @@ static void pump(ULONGLONG now)
             return;
         }
     }
+    // v0.40 8차: B/ESC 를 놓았으면 미뤄둔 입력모드 복구를 실행한다
+    if (g_restoreInputPending && !g_vstop &&   // 10차d: 재진입(예측) 중이면 동결 유지
+        !g_padBHeld.load(std::memory_order_relaxed) &&
+        !(GetAsyncKeyState(VK_ESCAPE) & 0x8000) &&
+        (!g_restoreWaitDir || !g_padDirHeld.load(std::memory_order_relaxed)))
+    {
+        g_restoreInputPending = false;
+        g_restoreWaitDir = false;
+        panelInputMode(false);
+        logf("inputmode: 지연 복구 실행 (키 놓음)");
+    }
+    // v0.40 9차: 진입의 정공은 편입(게임이 스스로 클론을 순회). 10차: 실측
+    // rootarr num=0(배열 미사용/늦은 초기화)에 대응해 ① 편입을 2초 주기 재시도
+    // ② 폴백 = 가상 정지(vstop): 설정<->나가기 경계 전이 순간 클론을 선택 표시
+    // + 게임 입력 UIOnly 동결(패널 실증 기성품), 방향/A/B 는 XInput 으로 처리.
+    // 포커스 계열(bIsFocusable/내비규칙/SetKeyboardFocus)은 실측 무효 -- 금지.
+    {
+        static ULONGLONG s_selPollMs = 0;
+        static int s_prevIdx = -1;
+        static unsigned char s_snap[280];
+        static bool s_snapValid = false;
+        static int s_snapLogBudget = 40;
+        static void* s_snapRoot = nullptr;
+        static int s_gen = -1;
+        static int s_parentChk = 0;
+        static ULONGLONG s_adoptRetryMs = 0;
+        static int s_idxBefore = -1;            // 10차e: 직전 선택 (전이 직전 값)
+        static ULONGLONG s_idxChangedMs = 0;    // 10차e: 그 전이를 관측한 시각
+        if (s_gen != g_menuGen)
+        {   // 메뉴 세대 교체(cloneLost) -- 지역 정적 잔존이 오발/허위 diff 를 만든다
+            s_gen = g_menuGen;
+            s_prevIdx = -1;
+            s_snapValid = false;
+            s_idxBefore = -1;
+            s_idxChangedMs = 0;
+        }
+        // 선택 스캔: 80ms 폴링과 패드 A 순간 재판정이 공유 (스테일 판정 방지)
+        auto scanSel = [&](bool& selOut, int& idxOut)
+        {
+            selOut = false;
+            idxOut = -1;
+            for (int si = 0; si < (int)g_siblings.size(); ++si)
+            {
+                UObject* it = reinterpret_cast<UObject*>(g_siblings[si]);
+                if (!it) continue;
+                UObject* ovl = readObjProp(it, L"OverlaySelected", "selpoll");
+                if (!ovl) continue;
+                UFunction* fv = fnOf(ovl, L"GetVisibility", "selpoll");
+                if (!fv || (int)fv->GetParmsSize() != 1) continue;
+                PB pb;
+                if (!peGuard(ovl, fv, pb.b)) continue;
+                if (pb.b[0] != 1)   // Collapsed(1) 아님 = 선택됨
+                {
+                    if (it == (UObject*)clone) selOut = true;
+                    else if (idxOut < 0) idxOut = si;
+                }
+            }
+        };
+        ULONGLONG navMs = g_lastPadNavMs.load(std::memory_order_relaxed);
+        bool padRecent = navMs && (now - navMs) < 400;
+        if (now - s_selPollMs >= 16)
+        {   // 10차c: 80→16ms -- 게임이 이웃(나가기/설정)을 먼저 칠하고 우리가
+            // 나중에 모드매니저로 바꿔 칠하는 "갔다가 돌아오는" 두 단계 이동이
+            // 사용자에게 그대로 보였다(라이브 보고). 사실상 매 펌프 틱 폴링으로
+            // 중간 단계를 1프레임 수준으로 줄인다. 스캔 비용은 PE 십수 회 = 무해.
+            s_selPollMs = now;
+            bool sel = false;
+            int curIdx = -1;
+            scanSel(sel, curIdx);
+            // 이중 하이라이트 소등 -- 비편입·비동결 세계 전용(vstop 표시는 우리가 켠 것)
+            if (!g_rootAdopted && !g_vstop && sel && curIdx >= 0 && !g_lastHover && !padRecent)
+            {
+                setSelectedRow(clone, false);
+                sel = false;
+            }
+            if (sel != g_menuCloneSel)
+            {
+                g_menuCloneSel = sel;
+                logf("menu: 클론 선택 %s%s (adopt=%d vstop=%d)", sel ? "ON" : "off",
+                     !sel ? "" : padRecent ? " (pad)" : g_lastHover ? " (hover)" : " (?)",
+                     (int)g_rootAdopted, (int)g_vstop);
+            }
+            // 10차d 흡수: 동결이 게임의 입력 처리보다 늦은 레이스 패배면 이웃이
+            // 늦게 켜진다 -- 그것이 게임 인덱스의 진실이므로 숨기고 복원 목표 갱신
+            if (g_vstop && curIdx >= 0 &&
+                g_inputMode.load(std::memory_order_relaxed) == 1)
+            {
+                void* late = g_siblings[curIdx];
+                UObject* lw = reinterpret_cast<UObject*>(late);
+                if (UObject* ovl = readObjProp(lw, L"OverlaySelected", "vstop"))
+                    setVisibility(ovl, 1, "vstop.late");
+                g_vstopGameSel = late;
+            }
+            // 10차g: 내비 기계가 아직 미특정이면 3초 주기 재탐색 (늦은 생성 대비)
+            static ULONGLONG s_navRetryMs = 0;
+            if (!g_navObj && g_root && now - s_navRetryMs >= 3000)
+            {
+                s_navRetryMs = now;
+                probeNavGraph(reinterpret_cast<UObject*>(g_root));
+            }
+            // 편입 재시도(2초): 배열이 늦게 채워지는 유형 대비 -- num>0 이 됐을 때만 본시도
+            if (!g_rootAdopted && !g_vstop && g_root && g_rootArrOff >= 0 &&
+                now - s_adoptRetryMs >= 2000)
+            {
+                s_adoptRetryMs = now;
+                struct { void* data; int num; int max; } ah{};
+                if (readBytesGuard(g_root, g_rootArrOff, &ah, 16) &&
+                    ah.data && ah.num > 0 && ah.max >= ah.num)
+                {
+                    UObject* bx = reinterpret_cast<UObject*>(g_doneBox.load());
+                    UObject* ex = reinterpret_cast<UObject*>(g_menuExit.load(std::memory_order_relaxed));
+                    if (bx && ex)
+                    {
+                        logf("adopt: 배열이 채워짐 (num=%d) -- 편입 재시도", ah.num);
+                        int ad = adoptAndAlign(clone, bx, ex);
+                        if (ad < 0) return;
+                        g_rootAdopted = (ad == 1);
+                    }
+                }
+            }
+            // 고아 감시(≈2.4초): 편입된 클론은 배열 GC 강참조로 "살아있으나 화면 밖"
+            // 유령이 가능 -- 부모 상실이면 전체 리셋으로 복구
+            if (g_rootAdopted && ++s_parentChk >= 150)   // 10차c: 16ms 틱 기준 ≈2.4초
+            {
+                s_parentChk = 0;
+                UFunction* fp = fnOf(clone, L"GetParent", "orphanChk");
+                if (fp && (int)fp->GetParmsSize() == 8)
+                {
+                    PB pb;
+                    void* par = nullptr;
+                    if (peGuard(clone, fp, pb.b))
+                    {
+                        memcpy(&par, pb.b + (int)fp->GetReturnValueOffset(), 8);
+                        if (!par)
+                        {
+                            cloneLost("클론이 박스에서 분리됨 (고아 감시)");
+                            return;
+                        }
+                    }
+                }
+            }
+            // 10차f navdiff: 선택 전이 순간 내비 기계(wnav + 그래프)의 변화 바이트.
+            // 선택 상태는 뿌리에 없음이 확정(rootidx 0줄) -- 실제 거처를 여기서 찾는다.
+            {
+                static unsigned char s_wnavSnap[0x100];
+                static unsigned char s_gSnap[2][0x180];
+                static bool s_navValid = false;
+                static void* s_navTag = nullptr;
+                static int s_navDiffBudget = 80;
+                if (g_navObj)
+                {
+                    if (s_navTag != g_navObj)
+                    {
+                        s_navTag = g_navObj;
+                        s_navValid = false;
+                    }
+                    unsigned char curW2[0x100];
+                    unsigned char curG[2][0x180];
+                    bool okW = readBytesGuard(g_navObj, 0, curW2, 0x100);
+                    bool okG0 = g_navGraphN > 0 && readBytesGuard(g_navGraph[0], 0, curG[0], 0x180);
+                    bool okG1 = g_navGraphN > 1 && readBytesGuard(g_navGraph[1], 0, curG[1], 0x180);
+                    if (okW)
+                    {
+                        if (curIdx != s_prevIdx && s_navValid && s_navDiffBudget > 0)
+                        {
+                            for (int k = 0; k < 0x100 && s_navDiffBudget > 0; ++k)
+                                if (curW2[k] != s_wnavSnap[k])
+                                {
+                                    --s_navDiffBudget;
+                                    logf("navdiff: wnav +0x%X %02X->%02X (sel %d->%d)",
+                                         k, s_wnavSnap[k], curW2[k], s_prevIdx, curIdx);
+                                }
+                            if (okG0)
+                                for (int k = 0; k < 0x180 && s_navDiffBudget > 0; ++k)
+                                    if (curG[0][k] != s_gSnap[0][k])
+                                    {
+                                        --s_navDiffBudget;
+                                        logf("navdiff: g0(k%d) +0x%X %02X->%02X (sel %d->%d)",
+                                             g_navGraphKey[0], k, s_gSnap[0][k], curG[0][k], s_prevIdx, curIdx);
+                                    }
+                            if (okG1)
+                                for (int k = 0; k < 0x180 && s_navDiffBudget > 0; ++k)
+                                    if (curG[1][k] != s_gSnap[1][k])
+                                    {
+                                        --s_navDiffBudget;
+                                        logf("navdiff: g1(k%d) +0x%X %02X->%02X (sel %d->%d)",
+                                             g_navGraphKey[1], k, s_gSnap[1][k], curG[1][k], s_prevIdx, curIdx);
+                                    }
+                        }
+                        memcpy(s_wnavSnap, curW2, 0x100);
+                        if (okG0) memcpy(s_gSnap[0], curG[0], 0x180);
+                        if (okG1) memcpy(s_gSnap[1], curG[1], 0x180);
+                        s_navValid = true;
+                    }
+                }
+            }
+            // rootidx 계측: 선택 전이 순간의 뿌리 스냅샷 diff (전이 동기 변화만 후보)
+            if (g_root && g_rootSnapOff > 0)
+            {
+                if (s_snapRoot != g_root)
+                {   // 뿌리 교체 -- 옛 뿌리 스냅샷과의 diff 는 전량 허위
+                    s_snapRoot = g_root;
+                    s_snapValid = false;
+                }
+                unsigned char cur[280];
+                bool rok = readBytesGuard(g_root, g_rootSnapOff, cur, 280);
+                static int s_snapHealth = -1;
+                if (s_snapHealth != (int)rok)
+                {   // 읽기 성패 1회 로그 -- "diff 0줄"이 침묵인지 무변화인지 판별용
+                    s_snapHealth = (int)rok;
+                    logf("rootsnap: read=%d win=0x%X+280", (int)rok, g_rootSnapOff);
+                }
+                if (rok)
+                {
+                    if (curIdx != s_prevIdx && s_snapValid && s_snapLogBudget > 0)
+                    {
+                        for (int k = 0; k < 280 && s_snapLogBudget > 0; ++k)
+                        {
+                            if (cur[k] != s_snap[k])
+                            {
+                                --s_snapLogBudget;
+                                logf("rootidx: [+0x%X] %02X->%02X (sel %d->%d)",
+                                     g_rootSnapOff + k, s_snap[k], cur[k], s_prevIdx, curIdx);
+                            }
+                        }
+                    }
+                    memcpy(s_snap, cur, 280);
+                    s_snapValid = true;
+                }
+            }
+            // 전이 처리: menusel 로그 + 가상 정지 진입
+            if (curIdx != s_prevIdx)
+            {
+                s_idxBefore = s_prevIdx;    // 10차e: "누른 시점의 선택" 복원용 이력
+                s_idxChangedMs = now;
+                static int s_selLogBudget = 30;
+                if (s_selLogBudget > 0)
+                {
+                    --s_selLogBudget;
+                    logf("menusel: %d -> %d (pad=%d)", s_prevIdx, curIdx, (int)padRecent);
+                }
+                void* optW = g_menuOption.load(std::memory_order_relaxed);
+                void* extW = g_menuExit.load(std::memory_order_relaxed);
+                void* curW = (curIdx >= 0 && curIdx < (int)g_siblings.size()) ? g_siblings[curIdx] : nullptr;
+                void* prvW = (s_prevIdx >= 0 && s_prevIdx < (int)g_siblings.size()) ? g_siblings[s_prevIdx] : nullptr;
+                bool crossOptExit = curW && prvW && optW && extW &&
+                    ((curW == extW && prvW == optW) || (curW == optW && prvW == extW));
+                if (g_vstopEnabled && !g_rootAdopted && !g_vstop && crossOptExit && padRecent && !g_panelOpen &&
+                    g_inputMode.load(std::memory_order_relaxed) == 1)
+                {   // 가상 정지 진입: 게임이 방금 선택한 항목(curW)을 숨기고 클론을
+                    // 표시, 게임 입력을 동결한다. 게임 내부 인덱스는 curW 에 머문다 --
+                    // 같은 방향으로 나가면 그 자리가 정답이라 정합이 유지된다.
+                    // 동결이 실제로 성공했을 때만 진입 -- 실패한 채 진행하면 게임과
+                    // 모드가 A/방향을 동시에 받아 이중 실행 사고(리뷰 확정).
+                    if (panelInputMode(true, clone))
+                    {
+                        g_vstop = true;
+                        g_vstopGameSel = curW;
+                        setSelectedRow(clone, true);
+                        clearOthers(clone);
+                        pokeSounds(clone, true);
+                        // 진입을 유발한 방향 엣지가 같은 틱의 엣지 소비부에서 즉시
+                        // 해제를 부르는 레이스(~25%, 리뷰) -- 트리거 엣지를 소거
+                        g_padEdges.exchange(0, std::memory_order_relaxed);
+                        logf("vstop: 가상 정지 진입 (게임선택 숨김, 입력 동결)");
+                    }
+                    else logf("WARN vstop: 입력 동결 실패 -- 진입 포기");
+                }
+            }
+            s_prevIdx = curIdx;
+        }
+        unsigned pe = g_padEdges.exchange(0, std::memory_order_relaxed);
+        bool fresh = pe && (now - g_padEdgeMs.load(std::memory_order_relaxed) < 400);
+        if (g_vstop)
+        {
+            if (g_inputMode.load(std::memory_order_relaxed) == 0)
+            {   // 마우스/키보드 개입(장치 전환) -- 취소하고 이번 틱은 계속 진행.
+                // (패널 열림 중에는 펌프가 훨씬 위에서 반환하므로 여기 못 온다)
+                exitVstop(clone, false);
+            }
+            else
+            {
+                if (fresh && (pe & PAD_A))
+                {   // 게임 선택 오버레이를 먼저 복원해 두고 패널을 연다(스크림 아래라
+                    // 시각 무해) -- 안 하면 패널을 닫은 뒤 "하이라이트 없는 메뉴에서
+                    // A = 보이지 않는 나가기 실행" 사고(리뷰 critical). 복구 보류를
+                    // 미리 무장해 openPanel 실패/SEH 에도 동결이 안 남게 한다 --
+                    // 성공 경로는 openPanel 이 보류를 취소하고 UIOnly 를 이어받는다.
+                    if (g_vstopGameSel)
+                    {
+                        UObject* gs = reinterpret_cast<UObject*>(g_vstopGameSel);
+                        if (UObject* ovl = readObjProp(gs, L"OverlaySelected", "vstop"))
+                            setVisibility(ovl, 4, "vstop.ovl");
+                        g_vstopGameSel = nullptr;
+                    }
+                    g_vstop = false;
+                    g_restoreInputPending = true;
+                    g_restoreWaitDir = false;
+                    logf("menu: 패드 A -- 패널 연다 (가상정지)");
+                    g_navSel = -1;
+                    openPanel(clone);
+                    if (g_reflFault) cloneLost("패널 생성 중 SEH");
+                    return;
+                }
+                if (fresh && (pe & (PAD_UP | PAD_DOWN)))
+                {   // 방향 이동 -- 게임 선택(동결 자리)으로 복귀. 같은 방향 진행이면
+                    // 그 자리가 다음 정답이라 자연 정합. 역방향은 화면이 한 칸
+                    // 되돌아가 보이지만(동결 자리 표시) 화면=게임 인덱스 일치가
+                    // 유지돼 A 오발이 원리적으로 없다 -- 안전 우선. 다음 전이에서
+                    // 재진입으로 수렴. 홀드 스크롤은 경계에서 한 번 멈춘다(의도).
+                    exitVstop(clone, true);
+                    return;
+                }
+                if (escEdge)
+                {   // 패드 B/키보드 ESC -- 취소 복귀. 래치는 펌프 선두가 이번 틱에
+                    // 소비한 값(escEdge)을 쓴다 -- 여기서 재소비하면 항상 0(리뷰).
+                    exitVstop(clone, false);
+                    return;
+                }
+                return;   // 동결 중에는 이하 일반 처리 건너뜀
+            }
+        }
+        // 10차d 예측 진입(이벤트 구동): 경계에서의 방향 엣지는 XInput(5ms 래치)이
+        // 게임보다 먼저 본다. 관측(폴링)을 기다리지 않고 즉시 동결+클론 표시 --
+        // "이웃을 갔다가 돌아오는" 두 단계와 왕복 시 복구 대기 지연을 함께 제거.
+        // 직전 해제의 동결(복구 보류)이 살아 있으면 그대로 재진입 = 게임 무관여.
+        // 게임이 이미 입력을 처리한 레이스 패배는 위 흡수부가 정합시킨다.
+        if (g_vstopEnabled && !g_vstop && !g_rootAdopted && !g_panelOpen && fresh &&
+            (pe & (PAD_UP | PAD_DOWN)) &&
+            g_inputMode.load(std::memory_order_relaxed) == 1)
+        {
+            void* optW = g_menuOption.load(std::memory_order_relaxed);
+            void* extW = g_menuExit.load(std::memory_order_relaxed);
+            // 10차e: s_prevIdx 는 이미 "이 입력의 결과"를 반영했을 수 있다(게임
+            // 프레임 16ms < 엣지 소비 33ms). 선택 변경이 엣지 래치 시각 이후에
+            // 관측됐다면 누른 시점의 값(s_idxBefore)으로 판정한다 -- 안 그러면
+            // 불러오기+↓ 가 "설정+↓" 로 오인돼 한 입력에 두 칸 이동(라이브 실측).
+            ULONGLONG pressMs = g_padEdgeMs.load(std::memory_order_relaxed);
+            int selIdx = s_prevIdx;
+            if (s_idxChangedMs && pressMs && s_idxChangedMs >= pressMs)
+                selIdx = s_idxBefore;
+            void* selW = (selIdx >= 0 && selIdx < (int)g_siblings.size())
+                             ? g_siblings[selIdx] : nullptr;
+            bool down = (pe & PAD_DOWN) != 0;
+            if (selW && optW && extW &&
+                ((selW == optW && down) || (selW == extW && !down)))
+            {
+                bool frozen = g_restoreInputPending;   // 직전 해제의 동결이 아직 유효
+                if (frozen || panelInputMode(true, clone))
+                {
+                    g_restoreInputPending = false;   // 재진입 -- 보류 복구 무효
+                    g_restoreWaitDir = false;
+                    g_vstop = true;
+                    g_vstopGameSel = selW;   // 동결이 선점했으면 게임 인덱스는 여기 머문다
+                    setSelectedRow(clone, true);
+                    clearOthers(clone);
+                    pokeSounds(clone, true);
+                    g_padEdges.exchange(0, std::memory_order_relaxed);
+                    logf("vstop: 예측 진입 (%s%s)", down ? "설정+아래" : "나가기+위",
+                         frozen ? ", 동결 연장" : "");
+                    return;
+                }
+            }
+        }
+        if (fresh && (pe & PAD_Y))
+        {   // 10차h: 패드 Y = 모드매니저 바로 열기. 메뉴 순회 편입은 다섯 구조 전부
+            // 실측 배제(STATUS) -- 게임과 경합하지 않는 전용 버튼이 정식 패드 경로다.
+            logf("menu: 패드 Y -- 패널 연다 (전용 버튼)");
+            g_navSel = -1;
+            openPanel(clone);
+            if (g_reflFault) cloneLost("패널 생성 중 SEH");
+            return;
+        }
+        if (fresh && (pe & PAD_A))
+        {   // A 는 즉석 재판정 -- 최대 80ms 묵은 폴링값은 이중 발동/무반응을 만든다
+            bool selNow = false;
+            int idxNow = -1;
+            scanSel(selNow, idxNow);
+            g_menuCloneSel = selNow;
+            if (selNow || g_lastHover)
+            {
+                logf("menu: 패드 A -- 패널 연다 (%s)", selNow ? "클론선택" : "호버");
+                g_navSel = -1;
+                openPanel(clone);
+                if (g_reflFault) cloneLost("패널 생성 중 SEH");
+                return;
+            }
+        }
+    }
     if (lmbEdge)
     {
         // 클릭 순간에는 stale 한 Slate hover 대신 좌표 산술로 다시 판정한다
@@ -6155,6 +7832,7 @@ static void pump(ULONGLONG now)
         if (hitNow == 1 || (hitNow < 0 && h == 1))
         {
             logf("menu: 클릭 감지 -- 패널 연다 (판정=%s)", hitNow == 1 ? "좌표" : "hover");
+            g_navSel = -1;   // 새로 열기 = 선택 없음
             openPanel(clone);
             if (g_reflFault) cloneLost("패널 생성 중 SEH");
         }
@@ -6162,6 +7840,420 @@ static void pump(ULONGLONG now)
 }
 
 // ======================= 삽입 본체 =========================================
+
+// ======================= v0.40 9차: 게임 항목 배열 편입 ====================
+// 조사 확정(STATUS 9차 절): 타이틀 메뉴의 패드 선택은 Slate 포커스가 아니라
+// 뿌리 UDLayerTitle(BP: DLayerTitleGame_C)이 내부 인덱스로 항목 목록
+// ListTitleMenuBtn(TArray @리플렉션 해석)을 순회하는 구조다. 클론이 그 목록에
+// 없으면 영원히 건너뛴다. 포커스 계열(bIsFocusable/내비규칙/SetKeyboardFocus)은
+// 전부 실측 무효 -- 재시도 금지.
+
+static void memSelfTest()
+{
+    if (g_memSelfTest != 0) return;
+    void* p = nullptr;
+    if (sehEngineMalloc(64, &p) == 0 && p)
+    {
+        void* pat = (void*)(unsigned long long)0x11223344AABBCCDDull;
+        void* r = nullptr;
+        if (writePtrGuard(p, 0, pat) && readPtrGuard(p, 0, &r) && r == pat &&
+            sehEngineFree(p) == 0)
+        {
+            g_memSelfTest = 1;
+            logf("mem: FMemory 왕복 자가시험 OK");
+            return;
+        }
+    }
+    g_memSelfTest = -1;
+    logf("WARN mem: FMemory 자가시험 실패 -- 재할당 영구 봉인 (편입은 Num<Max 일 때만)");
+}
+
+// BP 그래프가 선택을 몰면 인덱스는 리플렉션 가시 BP 변수다 -- 이름 탐침(1회 로그).
+// fnOf/propOffset 대신 seh* 직접 사용: 없는 이름이 정상이라 WARN/폴트를 내면 안 된다.
+static void probeRootVars(UObject* root)
+{
+    static const wchar_t* varNames[] = {
+        L"CurrentIndex", L"SelectedIndex", L"MenuIndex", L"SelectIndex", L"CurIndex",
+        L"NowIndex", L"CurrentMenuIndex", L"SelectedMenuIndex", L"FocusIndex",
+        L"SelectedIdx", L"CursorIndex", L"SelectCursor", L"CurrentSelect", L"MenuCursor",
+    };
+    for (const wchar_t* n : varNames)
+    {
+        FProperty* pr = nullptr;
+        if (sehGetProp(root, n, &pr) != 0 || !pr) continue;
+        int off = 0, sz = 0;
+        if (sehPropOffSize(pr, &off, &sz) != 0) continue;
+        logf("rootvar: %s off=0x%X size=%d", u8(n).c_str(), off, sz);
+    }
+    static const wchar_t* fnNames[] = {
+        L"SelectMenu", L"SetMenuIndex", L"MoveSelection", L"SetSelectMenu", L"SelectTitleMenu",
+        L"SetCurrentIndex", L"ChangeMenu", L"MoveMenu", L"NextMenu", L"PrevMenu",
+        L"SetSelect", L"OnSelectMenu", L"RefreshMenu", L"UpdateMenuSelect",
+    };
+    for (const wchar_t* n : fnNames)
+    {
+        UFunction* fn = nullptr;
+        if (sehGetFn(root, n, &fn) != 0 || !fn) continue;
+        logf("rootfn: %s parms=%d", u8(n).c_str(), (int)fn->GetParmsSize());
+    }
+}
+
+// v0.40 10차g: 게임의 방향 이동 기계 계측 v2. 뿌리의 ParentPanel 은 null 실측 --
+// DWidgetNavigation/DWidgetGraph 는 네이티브 클래스라 FindAllOf 로 직접 열거한다.
+// DWidgetGraph 는 리플렉션 0개 = 노드가 비-UObject 내부 구조 -> 메모리 스캔으로
+// 타이틀 항목 포인터(g_siblings)를 찾아 "타이틀 선택기 그래프"를 특정한다.
+
+static void dumpGraphHex(void* g, int gi, int key)
+{
+    unsigned char buf[0x180];
+    if (!readBytesGuard(g, 0, buf, 0x180))
+    {
+        logf("navhex: g%d 읽기 실패", gi);
+        return;
+    }
+    for (int off = 0; off < 0x180; off += 48)
+    {
+        char hex[48 * 2 + 4];
+        int p = 0;
+        for (int b = 0; b < 48; ++b) p += snprintf(hex + p, sizeof(hex) - p, "%02X", buf[off + b]);
+        logf("navhex: g%d(k%d) +0x%03X %s", gi, key, off, hex);
+    }
+}
+
+// 그래프 메모리에서 타이틀 항목 포인터 검색. 반환 = 히트 수.
+static int scanGraphForItems(void* g, int gi, int key)
+{
+    unsigned char buf[0x400];
+    if (!readBytesGuard(g, 0, buf, 0x400)) return 0;
+    int hits = 0;
+    for (int off = 0; off + 8 <= 0x400; off += 8)
+    {
+        void* v = nullptr;
+        memcpy(&v, buf + off, 8);
+        if (!v) continue;
+        for (int si = 0; si < (int)g_siblings.size(); ++si)
+            if (v == g_siblings[si])
+            {
+                ++hits;
+                logf("navhit: g%d(k%d) +0x%X = item[%d]", gi, key, off, si);
+            }
+    }
+    if (!hits)
+    {   // 1단계 간접: 앞 0xC0 의 포인터를 따라가 0x100 씩 훑는다 (노드 컨테이너 추정)
+        for (int off = 0; off + 8 <= 0xC0 && hits <= 12; off += 8)
+        {
+            void* p = nullptr;
+            memcpy(&p, buf + off, 8);
+            if (!p || ((unsigned long long)p & 0x7) != 0 || (unsigned long long)p < 0x10000) continue;
+            unsigned char sub[0x100];
+            if (!readBytesGuard(p, 0, sub, 0x100)) continue;
+            for (int so = 0; so + 8 <= 0x100; so += 8)
+            {
+                void* v = nullptr;
+                memcpy(&v, sub + so, 8);
+                if (!v) continue;
+                for (int si = 0; si < (int)g_siblings.size(); ++si)
+                    if (v == g_siblings[si])
+                    {
+                        ++hits;
+                        logf("navhit2: g%d(k%d) +0x%X -> +0x%X = item[%d]", gi, key, off, so, si);
+                    }
+            }
+        }
+    }
+    return hits;
+}
+
+static void probeNavGraph(UObject* root)
+{
+    (void)root;
+    g_navObj = nullptr;
+    g_navGraphN = 0;
+    struct Cand { void* g; int key; void* owner; };
+    Cand cands[16];
+    int candN = 0;
+    // 1) DWidgetNavigation 인스턴스들의 RoutingTable 에서 그래프 수집
+    std::vector<UObject*> wnavs;
+    UOG::FindAllOf(L"DWidgetNavigation", wnavs);
+    int wi = 0;
+    int rtOff = -1;
+    for (UObject* w : wnavs)
+    {
+        if (!w) continue;
+        std::wstring full = w->GetFullName(nullptr);
+        if (wcontains(full, L"Default__")) continue;
+        if (rtOff < 0)
+        {
+            rtOff = propOffset(w, L"RoutingTable", 80, "navg");
+            if (rtOff < 0) break;
+        }
+        struct { void* data; int num; int max; } arr{};
+        if (!readBytesGuard(w, rtOff, &arr, 16)) continue;
+        logf("navg: wnav[%d]=%p rt num=%d max=%d", wi, (void*)w, arr.num, arr.max);
+        if (arr.data && arr.num > 0 && arr.num <= 8)
+        {
+            for (int k = 0; k < arr.num && candN < 16; ++k)
+            {   // TMap 원소 = TSetElement<TPair<uint8,ptr>> 추정: stride 24, key@0, val@8
+                unsigned char key = 255;
+                void* gp = nullptr;
+                if (!readByteGuard(arr.data, k * 24, &key)) continue;
+                if (!readPtrGuard(arr.data, k * 24 + 8, &gp)) continue;
+                if (!gp) continue;
+                logf("navmap: wnav[%d][%d] key=%d graph=%p", wi, k, (int)key, gp);
+                cands[candN].g = gp;
+                cands[candN].key = (int)key;
+                cands[candN].owner = (void*)w;
+                ++candN;
+            }
+        }
+        if (++wi >= 8) break;
+    }
+    // 2) DWidgetGraph 직접 열거 (RoutingTable 에 안 걸린 것 포함)
+    std::vector<UObject*> graphs;
+    UOG::FindAllOf(L"DWidgetGraph", graphs);
+    for (UObject* g : graphs)
+    {
+        if (!g || candN >= 16) continue;
+        std::wstring full = g->GetFullName(nullptr);
+        if (wcontains(full, L"Default__")) continue;
+        bool known = false;
+        for (int k = 0; k < candN; ++k)
+            if (cands[k].g == (void*)g) known = true;
+        if (known) continue;
+        cands[candN].g = (void*)g;
+        cands[candN].key = -1;
+        cands[candN].owner = nullptr;
+        ++candN;
+    }
+    logf("navg: wnav %d개, 그래프 후보 %d개 (전체 열거 %d)", wi, candN, (int)graphs.size());
+    // 3) 스캔 -- 히트 그래프 우선 등록
+    int hitCount[16] = {};
+    for (int k = 0; k < candN; ++k)
+        hitCount[k] = scanGraphForItems(cands[k].g, k, cands[k].key);
+    for (int pass = 0; pass < 2; ++pass)
+        for (int k = 0; k < candN && g_navGraphN < 4; ++k)
+        {
+            bool want = (pass == 0) ? hitCount[k] > 0 : hitCount[k] == 0;
+            if (!want) continue;
+            g_navGraph[g_navGraphN] = cands[k].g;
+            g_navGraphKey[g_navGraphN] = cands[k].key;
+            ++g_navGraphN;
+            if (!g_navObj && cands[k].owner) g_navObj = cands[k].owner;
+        }
+    if (!g_navObj && g_navGraphN > 0) g_navObj = g_navGraph[0];
+    // 4) 히트 그래프 헥사 (없으면 앞 2개라도)
+    int dumped = 0;
+    for (int k = 0; k < candN && dumped < 3; ++k)
+        if (hitCount[k] > 0)
+        {
+            dumpGraphHex(cands[k].g, k, cands[k].key);
+            ++dumped;
+        }
+    if (!dumped)
+        for (int k = 0; k < candN && dumped < 2; ++k)
+        {
+            dumpGraphHex(cands[k].g, k, cands[k].key);
+            ++dumped;
+        }
+}
+
+static bool ensureRoot()
+{
+    if (g_root && g_rootArrOff >= 0) return true;
+    std::vector<UObject*> found;
+    UOG::FindAllOf(L"DLayerTitleGame_C", found);
+    UObject* cand = nullptr;
+    for (UObject* o : found)
+    {
+        if (!o) continue;
+        std::wstring full = o->GetFullName(nullptr);
+        if (wcontains(full, L"Default__")) continue;
+        cand = o;
+        break;
+    }
+    if (!cand)
+    {
+        logf("WARN root: DLayerTitleGame_C 라이브 인스턴스 없음");
+        return false;
+    }
+    int off = propOffset(cand, L"ListTitleMenuBtn", 16, "root");
+    if (off < 0)
+    {
+        logf("WARN root: ListTitleMenuBtn 해석 실패 -- 편입 불가");
+        return false;
+    }
+    int la = propOffset(cand, L"Load_Anim", 8, "root.snap");
+    g_root = (void*)cand;
+    g_rootArrOff = off;
+    g_rootSnapOff = (la > 0) ? la + 8 : off - 0x20;
+    logf("root: %s arrOff=0x%X snapOff=0x%X", u8(cand->GetName()).c_str(), off, g_rootSnapOff);
+    probeRootVars(cand);
+    probeNavGraph(cand);   // 10차f: 내비 기계(그래프) 계측
+    return true;
+}
+
+// 게임 항목 배열에 클론 편입. true = 배열에 있음(이번에 넣었든 이미 있든).
+// 재할당은 엔진 FMemory 확보 시에만 -- 이종 힙 버퍼를 게임에 넘기면 지연 크래시.
+static bool tryAdoptClone(UObject* clone, UObject* liveExit)
+{
+    if (!ensureRoot()) return false;
+    struct ArrHdr { void* data; int num; int max; };
+    ArrHdr arr{};
+    if (!readBytesGuard(g_root, g_rootArrOff, &arr, 16))
+    {
+        logf("FAIL rootarr: 헤더 읽기 AV");
+        return false;
+    }
+    UObject* root = reinterpret_cast<UObject*>(g_root);
+    static const wchar_t* itemNames[4] = {
+        L"TitleMenuBtn_PlayGame", L"TitleMenuBtn_LoadGame",
+        L"TitleMenuBtn_Option", L"TitleMenuBtn_Exit"};
+    int match = 0;
+    bool cloneIn = false;
+    bool liveIn = false;   // 방금 FindAllOf 로 얻은 라이브 exitW 가 배열에 있는가
+                           // -- 스테일(pending-kill) 뿌리의 자기일관 통과를 걸러낸다
+    if (arr.data && arr.num >= 1 && arr.num <= 16 && arr.max >= arr.num && arr.max <= 64)
+    {
+        for (const wchar_t* n : itemNames)
+        {
+            UObject* w = readObjProp(root, n, "rootarr");
+            if (!w) continue;
+            for (int jj = 0; jj < arr.num; ++jj)
+            {
+                void* e = nullptr;
+                if (readPtrGuard(arr.data, jj * 8, &e) && e == (void*)w) { ++match; break; }
+            }
+        }
+        for (int jj = 0; jj < arr.num; ++jj)
+        {
+            void* e = nullptr;
+            if (!readPtrGuard(arr.data, jj * 8, &e)) continue;
+            if (e == (void*)clone) cloneIn = true;
+            if (e == (void*)liveExit) liveIn = true;
+        }
+    }
+    logf("rootarr: num=%d max=%d match=%d/4 live=%d cloneIn=%d",
+         arr.num, arr.max, match, (int)liveIn, (int)cloneIn);
+    if (cloneIn) return true;
+    if (match < 4 || !liveIn)
+    {
+        logf("WARN rootarr: 항목 목록 검증 실패 -- 편입 포기");
+        return false;
+    }
+    if (arr.num < arr.max)
+    {   // 여유 있음 -- 제자리 append (재할당 불필요)
+        if (!writePtrGuard(arr.data, arr.num * 8, (void*)clone) ||
+            !writeIntGuard(g_root, g_rootArrOff + 8, arr.num + 1))
+        {
+            logf("FAIL append: 제자리 쓰기 AV");
+            return false;
+        }
+        logf("append: num %d->%d realloc=0", arr.num, arr.num + 1);
+        return true;
+    }
+    memSelfTest();
+    if (g_memSelfTest != 1)
+    {
+        logf("WARN append: 엔진 할당자 미확보 -- 재할당 포기");
+        return false;
+    }
+    int newMax = arr.max + 4;
+    void* nb = nullptr;
+    if (sehEngineMalloc((unsigned long long)newMax * 8, &nb) != 0 || !nb)
+    {
+        logf("FAIL append: FMemory::Malloc 실패");
+        return false;
+    }
+    bool ok = true;
+    for (int jj = 0; jj < arr.num && ok; ++jj)
+    {
+        void* e = nullptr;
+        ok = readPtrGuard(arr.data, jj * 8, &e) && writePtrGuard(nb, jj * 8, e);
+    }
+    if (ok) ok = writePtrGuard(nb, arr.num * 8, (void*)clone);
+    if (!ok)
+    {
+        sehEngineFree(nb);
+        logf("FAIL append: 새 버퍼 채우기 AV");
+        return false;
+    }
+    if (!writePtrGuard(g_root, g_rootArrOff, nb))
+    {   // 헤더 미변경 -- 새 버퍼만 회수하면 무손상
+        sehEngineFree(nb);
+        logf("FAIL append: Data 쓰기 AV");
+        return false;
+    }
+    if (!writeIntGuard(g_root, g_rootArrOff + 8, arr.num + 1) ||
+        !writeIntGuard(g_root, g_rootArrOff + 12, newMax))
+    {   // Data 는 새 버퍼 -- Num/Max 를 구값·실크기로 되돌려 정합시키고 포기
+        // (클론 원소는 Num 밖이라 게임이 못 본다. 구버퍼는 해제 위험 -> 누수 감수)
+        writeIntGuard(g_root, g_rootArrOff + 8, arr.num);
+        writeIntGuard(g_root, g_rootArrOff + 12, newMax);
+        logf("FAIL append: 헤더 갱신 AV -- Num 롤백");
+        return false;
+    }
+    sehEngineFree(arr.data);   // 구버퍼도 게임 GMalloc 산(産) -- 같은 경로로 해제
+    ArrHdr chk{};
+    readBytesGuard(g_root, g_rootArrOff, &chk, 16);
+    bool verify = (chk.data == nb && chk.num == arr.num + 1 && chk.max == newMax);
+    logf("append: num %d->%d realloc=1 verify=%d", arr.num, chk.num, (int)verify);
+    return verify;
+}
+
+// 편입 성공 시 클론을 수직박스 맨 아래로 -- 배열 순서 [..., Exit, 클론] 과 화면
+// 순서를 일치시킨다. 어긋나면 하이라이트가 건너뛰고 역행해 '나가기' 오발 사고
+// (반박 검증에서 시뮬레이션으로 확정된 시나리오).
+// 반환 3상: 1=성공 / 0=떼기 실패(클론은 제자리, 편입만 철회하면 됨) /
+//          -1=붙이기 실패(클론이 박스에서 떨어진 유령 -- 호출부가 전체 리셋)
+static int moveCloneBottom(UObject* box, UObject* clone)
+{
+    UFunction* fnAdd = fnOf(box, L"AddChild", "reorder2");
+    UFunction* fnRm = fnOf(box, L"RemoveChild", "reorder2");
+    if (!fnAdd || !fnRm || (int)fnAdd->GetParmsSize() != 16) return 0;
+    int ps = (int)fnRm->GetParmsSize();
+    int ro = (int)fnRm->GetReturnValueOffset();
+    if (!(ps > 8 && ps <= 64 && ro >= 8 && ro < 64)) return 0;
+    PB pb;
+    memcpy(pb.b, &clone, 8);
+    if (!peGuard(box, fnRm, pb.b) || pb.b[ro] == 0) return 0;
+    void* slot = nullptr;
+    for (int attempt = 0; attempt < 2 && !slot; ++attempt)
+    {   // AddChild 실패 = 클론 분리 유령 -- 1회 재시도(리뷰 확정 구멍)
+        PB pb2;
+        memcpy(pb2.b, &clone, 8);
+        if (peGuard(box, fnAdd, pb2.b))
+            memcpy(&slot, pb2.b + (int)fnAdd->GetReturnValueOffset(), 8);
+    }
+    return slot ? 1 : -1;
+}
+
+// v0.40 10차: 편입 + 순서 정합 일괄 (tryInject 와 폴링 재시도가 공유).
+// 반환 1=편입·정렬 완료 / 0=미편입(무손상 롤백) / -1=cloneLost 로 전체 리셋됨.
+static int adoptAndAlign(UObject* clone, UObject* box, UObject* exitW)
+{
+    if (!tryAdoptClone(clone, exitW)) return 0;
+    int mv = moveCloneBottom(box, clone);
+    if (mv == 1)
+    {
+        logf("adopt: 편입 완료 -- 클론 위치 = 맨 아래 (배열 순서 정합)");
+        return 1;
+    }
+    if (mv == 0)
+    {   // 클론은 제자리(나가기 위) -- 편입만 철회하면 비편입 세계로 무손상 복귀
+        struct { void* data; int num; int max; } a2{};
+        if (readBytesGuard(g_root, g_rootArrOff, &a2, 16) && a2.num > 0 && a2.data)
+        {
+            void* last = nullptr;
+            if (readPtrGuard(a2.data, (a2.num - 1) * 8, &last) && last == (void*)clone)
+                writeIntGuard(g_root, g_rootArrOff + 8, a2.num - 1);
+        }
+        logf("WARN adopt: 재정렬 불가(클론 무사) -- 편입 철회 (Num 원복)");
+        return 0;
+    }
+    logf("WARN adopt: 재정렬 중 클론 분리 -- 전체 리셋 후 재삽입");
+    cloneLost("편입 재정렬 분리");
+    return -1;
+}
 
 static void tryInject()
 {
@@ -6197,6 +8289,16 @@ static void tryInject()
         if (!sample && wcontains(name, L"Option")) sample = o;
     }
     g_siblings = runtimeEntries;  // clearOthers 캐시 (게임 스레드 전용)
+    {   // v0.40 진단(1회): menusel 인덱스가 어느 항목인지 해석할 이름표
+        static bool s_menuDumped = false;
+        if (!s_menuDumped)
+        {
+            s_menuDumped = true;
+            for (int si = 0; si < (int)g_siblings.size(); ++si)
+                logf("menuitem[%d]=%s", si,
+                     u8(reinterpret_cast<UObject*>(g_siblings[si])->GetName()).c_str());
+        }
+    }
 
     // 재삽입 판정: 박스 주소 비교는 할당자 주소 재사용(ABA)에 속는다(리뷰 확정).
     // 대신 "내 클론이 방금 가져온 살아있는 목록에 있는가"로 판정한다 -- 역참조 없음.
@@ -6236,6 +8338,14 @@ static void tryInject()
         return;
     }
 
+    // v0.40(pad): 워프 판정용 이웃(설정/나가기)과 선택 이벤트 함수 캐시
+    g_menuOption.store((void*)sample, std::memory_order_relaxed);
+    g_menuExit.store((void*)exitW, std::memory_order_relaxed);
+    if (!g_fnSelChanged.load(std::memory_order_relaxed))
+        g_fnSelChanged.store((void*)fnOf(exitW, L"BP_OnItemSelectionChanged", "selhook"),
+                             std::memory_order_relaxed);
+
+    ensureLang();   // v0.40: 메뉴 항목 라벨 언어를 먼저 확정한다
     logf("inject: 시작 -- 런타임 항목 %d개, exit=%s, box=%p",
          runtimeCount, u8(exitW->GetName()).c_str(), (void*)box);
 
@@ -6250,6 +8360,7 @@ static void tryInject()
     // 5) PlayerController (타이틀에도 DsTPCTR_C 존재 실측 -- world_census.txt)
     UObject* pc = UOG::FindFirstOf(L"PlayerController");
     logf("inject: pc=%p%s", (void*)pc, pc ? "" : " (null -- WorldContext 는 형제 위젯으로 대체)");
+    g_pcPanel = (void*)pc;   // v0.40 4차: 메뉴 가상 포커스의 입력모드 전환용
 
     // 6) WidgetBlueprintLibrary CDO -> Create(ctx, wcls, pc)
     UObject* lib = UOG::StaticFindObject_InternalSlow(
@@ -6302,13 +8413,22 @@ static void tryInject()
         g_gameThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
         g_lastHover = false;
         g_siblings.push_back((void*)clone);
+        // v0.40 9차: 게임 항목 배열 편입. 성공하면 시각 순서도 배열과 일치시키고,
+        // 시각 재정렬이 실패하면 편입을 철회한다(순서 불일치 = 나가기 오발 위험).
+        {   // 10차: 배열이 비어 있으면(실측 num=0) 여기선 미편입으로 남고,
+            // 폴링이 2초 주기로 재시도한다. 폴백 = 가상 정지(vstop).
+            int ad = adoptAndAlign(clone, box, exitW);
+            if (ad < 0) return;
+            g_rootAdopted = (ad == 1);
+        }
+        wireNav(clone, sample, exitW);   // v0.40 5차: 게임 내비 링에 끼우기 (무해 -- 유지)
         startPulseTimer(clone);  // v0.7: 20ms 게임스레드 펄스 (입력 반응성)
         // v0.9: 좌표 히트테스트 준비 상태 1회 진단
         sampleMouse();
         logf("hit: sbl=%p wll=%p mouse=%s(%.0f,%.0f)", (void*)g_sbl, (void*)g_wll,
              g_mouseOk ? "OK" : "실패", g_mouseX, g_mouseY);
         logf("MM_RESULT: INJECT_OK clone=%p box=%p gameThread=%lu label='%s'",
-             (void*)clone, (void*)box, GetCurrentThreadId(), u8(LABEL).c_str());
+             (void*)clone, (void*)box, GetCurrentThreadId(), u8(trLabel()).c_str());
     }
     else
     {
@@ -6320,6 +8440,98 @@ static void tryInject()
             logf("MM_RESULT: FAIL 고아 클론 5개 누적 -- 영구 중단 (위젯 누수 방지)");
         }
     }
+}
+
+// v0.40 11b: 클론 항목에 패드 Y 아이콘을 붙인다. 순회 편입(패드로 항목 이동해
+// 클론에 멈추기)은 다섯 구조 + 네이티브 RE 로 전부 배제됐다(순회=엔진 Slate 내비,
+// 게임 함수 아님, 바이트 시그니처 디투어는 200+ 충돌로 폐기). 그래서 타이틀
+// 패드 진입은 전용 Y 버튼이 정식 경로이고, 그 힌트로 라벨 옆에 Y 아이콘을 둔다.
+// 안전: 전부 SEH 가드, 실패하면 조용히 생략(라벨은 그대로, Y 버튼도 그대로 동작).
+static void addClonePadIcon(UObject* clone)
+{
+    g_padIcon = nullptr;
+    UObject* tree = readObjProp(clone, L"WidgetTree", "padico");
+    UObject* tt = readObjProp(clone, L"TitleText", "padico");
+    if (!tree || !tt) { logf("padico: WidgetTree/TitleText 없음 -- 아이콘 생략"); return; }
+    // 글자 바로 옆에 붙이려면 TitleText 와 아이콘을 HorizontalBox 로 묶어 원래
+    // 자리(TitleText 의 부모)에 도로 넣는다. TitleText 부모는 Border(단일자식)
+    // 실측 -- HBox 를 그 content 로 넣으면 [글자][아이콘]이 한 덩이로 붙는다.
+    UFunction* fnPar = fnOf(tt, L"GetParent", "padico");
+    if (!fnPar || (int)fnPar->GetParmsSize() != 8) { logf("padico: GetParent 없음"); return; }
+    PB pbp;
+    if (!peGuard(tt, fnPar, pbp.b)) { logf("padico: GetParent SEH"); return; }
+    void* parRaw = nullptr;
+    memcpy(&parRaw, pbp.b + (int)fnPar->GetReturnValueOffset(), 8);
+    UObject* parent = reinterpret_cast<UObject*>(parRaw);
+    if (!parent) { logf("padico: TitleText 부모 null -- 생략"); return; }
+    std::wstring pname;
+    if (UClass* pc = parent->GetClassPrivate()) pname = pc->GetName();
+    logf("padico: TitleText 부모 = %s", u8(pname).c_str());
+    // Border/SizeBox/ScaleBox 등 단일자식 컨테이너여야 안전하게 감쌀 수 있다.
+    bool single = wcontains(pname, L"Border") || wcontains(pname, L"SizeBox") ||
+                  wcontains(pname, L"ScaleBox") || wcontains(pname, L"Button");
+    if (!single) { logf("padico: 부모가 단일자식 아님(%s) -- 감싸기 생략", u8(pname).c_str()); return; }
+    UObject* gs = findObj(L"/Script/Engine.Default__GameplayStatics", "padico");
+    UObject* bCls = findObj(L"/Script/UMG.Border", "padico");
+    UObject* sCls = findObj(L"/Script/UMG.SizeBox", "padico");
+    UObject* hCls = findObj(L"/Script/UMG.HorizontalBox", "padico");
+    UObject* krl = findObj(L"/Script/Engine.Default__KismetRenderingLibrary", "padico");
+    if (!gs || !bCls || !sCls || !hCls) { logf("padico: 클래스 해석 실패 -- 생략"); return; }
+    UFunction* fnSpawn = fnOf(gs, L"SpawnObject", "padico");
+    if (!fnSpawn || (int)fnSpawn->GetParmsSize() != 24) { logf("padico: SpawnObject 없음"); return; }
+    auto spawn = [&](UObject* cls) -> UObject* {
+        PB pb;
+        memcpy(pb.b + 0, &cls, 8);
+        memcpy(pb.b + 8, &tree, 8);
+        if (!peGuard(gs, fnSpawn, pb.b)) return nullptr;
+        void* w = nullptr;
+        memcpy(&w, pb.b + (int)fnSpawn->GetReturnValueOffset(), 8);
+        return reinterpret_cast<UObject*>(w);
+    };
+    UObject* box = spawn(sCls);
+    if (!box) { logf("padico: SizeBox spawn 실패 -- 생략"); return; }
+    float iw = 30.0f, ih = 30.0f;
+    callBytes(box, L"SetWidthOverride", &iw, 4, "padico");
+    callBytes(box, L"SetHeightOverride", &ih, 4, "padico");
+    UObject* tex = nullptr;
+    UFunction* fnImp = krl ? fnOf(krl, L"ImportFileAsTexture2D", "padico") : nullptr;
+    if (fnImp && (int)fnImp->GetParmsSize() == 32)
+    {
+        static wchar_t tp[MAX_PATH * 2];
+        assetPath(tp, L"pad_y.png");
+        PB pb;
+        UObject* c3 = clone;
+        memcpy(pb.b + 0, &c3, 8);
+        FStringRaw fs{tp, (int)wcslen(tp) + 1, (int)wcslen(tp) + 1};
+        memcpy(pb.b + 8, &fs, 16);
+        if (peGuard(krl, fnImp, pb.b))
+            memcpy(&tex, pb.b + (int)fnImp->GetReturnValueOffset(), 8);
+    }
+    if (UObject* im = spawn(bCls))
+    {
+        if (tex) callBytes(im, L"SetBrushFromTexture", &tex, 8, "padico");
+        setBrushColor(im, {1, 1, 1, 1}, "padico");
+        setVisibility(im, 4, "padico");
+        slotAlign(addChildTo(box, im, "padico"), 0, 0, "padico");
+    }
+    // [글자][아이콘] HBox 를 만들어 Border content 로 되돌린다.
+    UObject* hbox = spawn(hCls);
+    if (!hbox) { logf("padico: HBox spawn 실패 -- 생략"); return; }
+    // 1) TitleText 를 HBox 로 옮긴다(AddChild 가 옛 부모 Border 에서 자동 분리).
+    slotAlign(addChildTo(hbox, tt, "padico"), -1, 2, "padico");       // 세로 중앙
+    // 2) 아이콘을 글자 바로 뒤에.
+    UObject* isl = addChildTo(hbox, box, "padico");
+    slotAlign(isl, -1, 2, "padico");
+    slotPad(isl, 10, 0, 0, 0, "padico");     // 글자와 아이콘 사이 10px
+    // 3) HBox 를 Border content 로 (Border 는 자동으로 가운데 정렬 -> 덩이째 중앙).
+    UObject* hsl = addChildTo(parent, hbox, "padico");
+    if (!hsl) { logf("padico: Border 에 HBox 부착 실패 -- 생략"); return; }
+    slotAlign(hsl, 2, 2, "padico");          // 가로/세로 중앙
+    bool padOn = g_inputMode.load(std::memory_order_relaxed) == 1 &&
+                 g_padPresent.load(std::memory_order_relaxed);
+    setVisibility(box, padOn ? 4 : 1, "padico");
+    g_padIcon = (void*)box;
+    logf("padico: Y 아이콘 부착 완료 (부모=%s tex=%d)", u8(pname).c_str(), tex ? 1 : 0);
 }
 
 // 7-11) Create 된 클론의 무해화 -> 부착 -> 마감. 핵심 성공 조건은
@@ -6444,12 +8656,13 @@ static bool finishClone(UObject* box, UObject* exitW, UObject* sample, UObject* 
     //     setHitTest: 행 자체는 Visible(0) = 히트테스트 대상
     setVisibility(clone, 0, "hitTest");
 
+    addClonePadIcon(clone);   // 11b: 패드 Y 아이콘(전용 진입 버튼 힌트)
     return true;
 }
 
 // ---------------------------------------------------------------- PE 콜백
 
-static void onProcessEventPre(UObject* context, UFunction* function, void* /*parms*/)
+static void onProcessEventPre(UObject* context, UFunction* function, void* parms)
 {
     if (!function || t_busy || g_hardFail.load(std::memory_order_relaxed)) return;
 
@@ -6470,10 +8683,54 @@ static void onProcessEventPre(UObject* context, UFunction* function, void* /*par
         }
     }
 
+    // v0.40(pad): 메뉴 선택 이동 관측 -- BP_OnItemSelectionChanged(bool).
+    // 포인터 비교 한 번이라 모든 PE 트래픽에 얹어도 공짜다.
+    // 진단(예산 8): 클론이 실제로 포커스를 받는 순간을 직접 증명
+    if (context && function == reinterpret_cast<UFunction*>(g_fnFocusRecv.load(std::memory_order_relaxed)) &&
+        context == reinterpret_cast<UObject*>(g_myClone.load(std::memory_order_relaxed)))
+    {
+        static std::atomic<int> s_focusLogBudget{8};
+        if (s_focusLogBudget.fetch_sub(1, std::memory_order_relaxed) > 0)
+            logf("menufocus: 클론 OnFocusReceived!");
+    }
+    if (parms && context &&
+        function == reinterpret_cast<UFunction*>(g_fnSelChanged.load(std::memory_order_relaxed)))
+    {
+        g_selEvtOn.store(*(unsigned char*)parms, std::memory_order_relaxed);
+        g_selEvtItem.store((void*)context, std::memory_order_relaxed);
+    }
+
     // 콜백 밖으로는 어떤 C++ 예외도 내보내지 않는다 (14:19 크래시 교훈:
     // 엔진/UE4SS 경계를 넘는 예외 = terminate).
     try
     {
+        // v0.40 9차 진단(예산 6): OnKeyDown 수신자 = 포커스를 쥔 위젯(뿌리 검증).
+        // 여기(이벤트 수신 순간)는 context 생존이 보장된다 -- 펌프로 미루면 TRAPS X.
+        if (context && function == reinterpret_cast<UFunction*>(g_fnKeyDown.load(std::memory_order_relaxed)))
+        {
+            static std::atomic<void*> s_lastKeyCtx{nullptr};
+            static std::atomic<int> s_keyCtxBudget{6};
+            if ((void*)context != s_lastKeyCtx.load(std::memory_order_relaxed) &&
+                s_keyCtxBudget.fetch_sub(1, std::memory_order_relaxed) > 0)
+            {
+                s_lastKeyCtx.store((void*)context, std::memory_order_relaxed);
+                logf("keyrecv: %s", u8(context->GetFullName(nullptr)).c_str());
+            }
+        }
+        // v0.40 9차 진단(예산 60): 게임의 선택 이동 스트림. 편입 후 패드 하강에서
+        // 클론에 on=1 이 찍히면 결정적 성공 신호 (침묵은 실패 증거가 아니다 --
+        // 패드 경로는 이 이벤트를 안 거칠 수 있음이 실측됨. 정본 판정은 폴링)
+        if (parms && context &&
+            function == reinterpret_cast<UFunction*>(g_fnSelChanged.load(std::memory_order_relaxed)))
+        {
+            static std::atomic<int> s_selEvtBudget{60};
+            if (s_selEvtBudget.fetch_sub(1, std::memory_order_relaxed) > 0)
+            {
+                logf("selEvt: %s on=%d%s", u8(context->GetName()).c_str(),
+                     (int)*(unsigned char*)parms,
+                     (void*)context == g_myClone.load(std::memory_order_relaxed) ? " *클론" : "");
+            }
+        }
         // 함수 분류(포인터당 1회): 타이틀 메뉴 관련 트래픽만 트리거로 삼는다
         unsigned char cls = 0;
         {
@@ -6490,6 +8747,23 @@ static void onProcessEventPre(UObject* context, UFunction* function, void* /*par
                       : 2;
             std::lock_guard<std::mutex> lk(g_mx);
             g_fnClass[function] = cls;
+            // v0.40 진단: 타이틀 메뉴/내비 함수 어휘를 처음 볼 때 잡는다(패드로 메뉴를
+            // 움직이면 게임이 부르는 내비 함수가 여기 찍힌다). 예산 90, 함수당 1회.
+            if (wcontains(full, L"UserWidget:OnFocusReceived"))
+                g_fnFocusRecv.store((void*)function, std::memory_order_relaxed);
+            if (wcontains(full, L"UserWidget:OnKeyDown"))
+                g_fnKeyDown.store((void*)function, std::memory_order_relaxed);
+            static int s_menuFnBudget = 90;
+            if (s_menuFnBudget > 0 &&
+                (wcontains(full, L"TitleMenu") || wcontains(full, L"Navigat") ||
+                 wcontains(full, L"MenuMove") || wcontains(full, L"MoveMenu") ||
+                 wcontains(full, L"SelectMenu") || wcontains(full, L"MenuSelect") ||
+                 wcontains(full, L"OnKey") || wcontains(full, L"Focus") ||
+                 wcontains(full, L"MenuBtn") || wcontains(full, L"MenuButton")))
+            {
+                --s_menuFnBudget;
+                logf("menufn: %s", u8(full).c_str());
+            }
         }
         // v0.2 펌프: 삽입 완료 후, 게임 스레드(삽입 순간 캡처한 ID)의 아무
         // PE 호출에나 편승해 33ms 간격으로 호버/클릭/패널 입력을 처리한다.
@@ -6562,10 +8836,10 @@ class DsCppModManager final : public RC::CppUserModBase
     DsCppModManager()
     {
         ModName = L"DsCppModManager";
-        ModVersion = L"0.30";
+        ModVersion = L"0.40";
         ModDescription = L"Mod manager: key-bind and color-picker option controls";
         ModAuthors = L"SummerSpring";
-        logf("start_mod: ctor OK (v0.28)");
+        logf("start_mod: ctor OK (%s)", u8(MOD_VER_W).c_str());
     }
 
     ~DsCppModManager() override
@@ -6588,18 +8862,38 @@ class DsCppModManager final : public RC::CppUserModBase
         // 이 스레드는 게임 스레드가 아니다 -- UMG 는 금지, 키 상태 읽기는 안전
         // (프로브 F9 실증). v0.7: 입력 엣지를 여기(5ms 주기, 항상 돎)서 래치해
         // 게임 스레드 펌프가 소비 -- PE 기근으로 클릭을 놓치던 지연의 해결책 ①.
+        // v0.40: 게임 창이 앞에 있을 때만 입력 엣지를 만든다. GetAsyncKeyState 는
+        // 전역이고 게임의 커서 좌표는 포커스가 없어도 살아 있어서, 게임 위에 겹친
+        // 탐색기를 클릭하면 그 자리의 컨트롤이 눌렸다 (실측 2026-08-10 21:14 --
+        // 화면 밖 좌표 (5562,1937) 가 히트 판정에 들어온 로그).
+        // 물리 상태(m_lmbPrev/m_escPrev)는 배경에서도 계속 추적한다 --
+        // 포커스 복귀 순간 배경에서 생긴 눌림/뗌이 유령 엣지가 되는 것을 막는다.
+        HWND fgWnd = GetForegroundWindow();
+        DWORD fgPid = 0;
+        if (fgWnd) GetWindowThreadProcessId(fgWnd, &fgPid);
+        const bool fgOurs = (fgPid == GetCurrentProcessId());
         bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-        if (lmb && !m_lmbPrev) g_pendClickMs.store(GetTickCount64(), std::memory_order_relaxed);
-        if (!lmb && m_lmbPrev)
+        if (fgOurs)
         {
-            ULONGLONG t = GetTickCount64();
-            g_lmbUpMs.store(t, std::memory_order_relaxed);
-            g_pendUpMs.store(t, std::memory_order_relaxed);  // v0.17: 펌프가 소비할 뗌 엣지
+            if (lmb && !m_lmbPrev)
+            {
+                g_pendClickMs.store(GetTickCount64(), std::memory_order_relaxed);
+                g_inputMode.store(0, std::memory_order_relaxed);   // v0.40: 마우스 사용
+            }
+            if (!lmb && m_lmbPrev)
+            {
+                ULONGLONG t = GetTickCount64();
+                g_lmbUpMs.store(t, std::memory_order_relaxed);
+                g_pendUpMs.store(t, std::memory_order_relaxed);  // v0.17: 펌프가 소비할 뗌 엣지
+            }
+            g_lmbHeld.store(lmb, std::memory_order_relaxed);  // v0.16: 드래그 유지 판정용
         }
+        else
+            g_lmbHeld.store(false, std::memory_order_relaxed);
         m_lmbPrev = lmb;
-        g_lmbHeld.store(lmb, std::memory_order_relaxed);  // v0.16: 드래그 유지 판정용
         // v0.28: 키 캡처 중에만 전체 가상키를 훑는다 (평상시엔 낭비라 안 한다)
-        if (g_keyCapture.load(std::memory_order_relaxed) &&
+        // v0.40: 배경에서는 훑지 않는다 -- 다른 창에 치는 타자가 바인딩되면 안 된다
+        if (fgOurs && g_keyCapture.load(std::memory_order_relaxed) &&
             g_capturedVk.load(std::memory_order_relaxed) == 0)
         {
             for (int vk = 0x01; vk <= 0xFE; ++vk)
@@ -6613,8 +8907,122 @@ class DsCppModManager final : public RC::CppUserModBase
             }
         }
         bool esc = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
-        if (esc && !m_escPrev) g_pendEscMs.store(GetTickCount64(), std::memory_order_relaxed);
+        if (fgOurs && esc && !m_escPrev)
+        {
+            g_pendEscMs.store(GetTickCount64(), std::memory_order_relaxed);
+            g_inputMode.store(0, std::memory_order_relaxed);   // v0.40: 키보드 사용
+        }
         m_escPrev = esc;
+        // v0.40: 마우스가 3px 만 움직여도 키/마 모드 -- 게임 설정창 실측(패드 UI 즉시 숨김)
+        {
+            static POINT s_lastCur = {-100000, -100000};
+            POINT cp;
+            if (GetCursorPos(&cp))
+            {
+                if (fgOurs && s_lastCur.x != -100000 &&
+                    (cp.x - s_lastCur.x > 3 || s_lastCur.x - cp.x > 3 ||
+                     cp.y - s_lastCur.y > 3 || s_lastCur.y - cp.y > 3))
+                    g_inputMode.store(0, std::memory_order_relaxed);
+                s_lastCur = cp;
+            }
+        }
+        // v0.40(pad): XInput 폴링 -- 엣지 래치 + 방향 자동 반복(350ms 후 130ms)
+        // 리뷰 반영 셋: ① 물리 상태(s_prevBtn)는 배경에서도 추적한다 -- 포커스 복귀
+        // 순간의 유령 엣지 방지(마우스와 같은 규율). ② 패드가 없으면 3초에 한 번만
+        // 재탐색한다 -- 빈 슬롯 XInputGetState 는 장치 열거라 비싸다. ③ 반복 방향은
+        // 언제나 하나(대각선 플릭은 세로 우선)고, 놓으면 눌려 있는 다른 방향이 이어받는다.
+        {
+            static int s_padSlot = -1;
+            static WORD s_prevBtn = 0;
+            static ULONGLONG s_repDirMs = 0;
+            static unsigned s_repDir = 0;
+            static ULONGLONG s_nextScanMs = 0;
+            ULONGLONG pnow = GetTickCount64();
+            XINPUT_STATE xs;
+            memset(&xs, 0, sizeof(xs));
+            bool got = false;
+            if (s_padSlot >= 0)
+            {
+                if (XInputGetState((DWORD)s_padSlot, &xs) == ERROR_SUCCESS) got = true;
+                else { s_padSlot = -1; s_nextScanMs = pnow + 3000; }
+            }
+            else if (pnow >= s_nextScanMs)
+            {
+                for (int gi = 0; gi < 4 && !got; ++gi)
+                    if (XInputGetState((DWORD)gi, &xs) == ERROR_SUCCESS) { s_padSlot = gi; got = true; }
+                if (!got) s_nextScanMs = pnow + 3000;
+            }
+            g_padPresent.store(got, std::memory_order_relaxed);
+            if (got)
+            {
+                WORD b = xs.Gamepad.wButtons;
+                if (xs.Gamepad.sThumbLY > 20000) b |= XINPUT_GAMEPAD_DPAD_UP;
+                if (xs.Gamepad.sThumbLY < -20000) b |= XINPUT_GAMEPAD_DPAD_DOWN;
+                if (xs.Gamepad.sThumbLX < -20000) b |= XINPUT_GAMEPAD_DPAD_LEFT;
+                if (xs.Gamepad.sThumbLX > 20000) b |= XINPUT_GAMEPAD_DPAD_RIGHT;
+                WORD rise = (WORD)(b & (WORD)~s_prevBtn);
+                s_prevBtn = b;   // ★ 전경 여부와 무관하게 추적
+                g_padBHeld.store((b & XINPUT_GAMEPAD_B) != 0, std::memory_order_relaxed);
+                g_padDirHeld.store((b & (XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN |
+                                         XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT)) != 0,
+                                   std::memory_order_relaxed);
+                if (fgOurs)
+                {
+                    unsigned e = 0;
+                    if (rise & XINPUT_GAMEPAD_DPAD_UP) e |= PAD_UP;
+                    if (rise & XINPUT_GAMEPAD_DPAD_DOWN) e |= PAD_DOWN;
+                    if (rise & XINPUT_GAMEPAD_DPAD_LEFT) e |= PAD_LEFT;
+                    if (rise & XINPUT_GAMEPAD_DPAD_RIGHT) e |= PAD_RIGHT;
+                    if (rise & XINPUT_GAMEPAD_A) e |= PAD_A;
+                    if (rise & XINPUT_GAMEPAD_LEFT_SHOULDER) e |= PAD_LB;
+                    if (rise & XINPUT_GAMEPAD_RIGHT_SHOULDER) e |= PAD_RB;
+                    if (rise & XINPUT_GAMEPAD_Y) e |= PAD_Y;   // 10차h: 타이틀 = 매니저 열기
+                    if (rise & XINPUT_GAMEPAD_B)
+                    {
+                        g_pendEscMs.store(pnow, std::memory_order_relaxed);
+                        g_inputMode.store(1, std::memory_order_relaxed);
+                    }
+                    unsigned held = 0;
+                    if (b & XINPUT_GAMEPAD_DPAD_UP) held |= PAD_UP;
+                    if (b & XINPUT_GAMEPAD_DPAD_DOWN) held |= PAD_DOWN;
+                    if (b & XINPUT_GAMEPAD_DPAD_LEFT) held |= PAD_LEFT;
+                    if (b & XINPUT_GAMEPAD_DPAD_RIGHT) held |= PAD_RIGHT;
+                    unsigned eDir = e & (PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT);
+                    if (eDir)
+                    {
+                        s_repDir = (eDir & PAD_UP) ? PAD_UP : (eDir & PAD_DOWN) ? PAD_DOWN
+                                 : (eDir & PAD_LEFT) ? PAD_LEFT : PAD_RIGHT;
+                        s_repDirMs = pnow + 350;
+                    }
+                    else if (s_repDir && !(held & s_repDir))
+                    {
+                        s_repDir = (held & PAD_UP) ? PAD_UP : (held & PAD_DOWN) ? PAD_DOWN
+                                 : (held & PAD_LEFT) ? PAD_LEFT : (held & PAD_RIGHT) ? PAD_RIGHT : 0;
+                        s_repDirMs = pnow + 350;
+                    }
+                    else if (s_repDir && pnow >= s_repDirMs)
+                    {
+                        e |= s_repDir;
+                        s_repDirMs = pnow + 130;
+                    }
+                    if (e)
+                    {
+                        g_padEdges.fetch_or(e, std::memory_order_relaxed);
+                        g_padEdgeMs.store(pnow, std::memory_order_relaxed);
+                        g_inputMode.store(1, std::memory_order_relaxed);   // v0.40: 패드 사용
+                        if (e & (PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT))
+                            g_lastPadNavMs.store(pnow, std::memory_order_relaxed);
+                    }
+                }
+                else s_repDir = 0;
+            }
+            else
+            {
+                s_prevBtn = 0;
+                g_padBHeld.store(false, std::memory_order_relaxed);
+                g_padDirHeld.store(false, std::memory_order_relaxed);
+            }
+        }
 
         // ⚠ 14:19 크래시 원인 지점: 여기서 IsInGameThread() 를 무방비로 불렀었다.
         if (m_first)
@@ -6640,6 +9048,7 @@ class DsCppModManager final : public RC::CppUserModBase
         {
             m_lastZipScan = now;
             extractPluginZips();
+            wrapLoosePaks();   // v0.40: 낱개 pak 파일 감싸기 (같은 3초 스윕)
         }
         if (now - m_lastBeat >= 60000)
         {

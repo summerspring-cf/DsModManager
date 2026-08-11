@@ -224,6 +224,23 @@ namespace RC::Unreal
     };
     static_assert(sizeof(FText) == 24, "FText 전사 크기가 실측(24)과 다름");
 
+    /*
+      FMemory -- 엔진 할당자 정적 브리지 (v0.40 9차).
+      UE4SS 가 GMalloc 을 시그니처로 해석해 라우팅한다(UE4SS 자신이 FString 을
+      이 경로로 할당해 게임이 해제한다 -- 동작 전제는 UE4SS 코어와 같다).
+      링크 성공은 호출 안전 증명이 아니므로 첫 사용 전 SEH 썽크 + 왕복 자가시험.
+      용도: 게임 소유 TArray 재확보. 모드 CRT 힙 버퍼를 게임 배열에 넣으면
+      게임이 해제할 때 이종 힙 크래시 -- 반드시 이 경로만 쓴다.
+    */
+    class FMemory
+    {
+      public:
+        // UE4SS.def:2636  ?Malloc@FMemory@Unreal@RC@@SAPEAX_KI@Z
+        __declspec(dllimport) static auto Malloc(unsigned long long count, unsigned int alignment) -> void*;
+        // UE4SS.def:1163  ?Free@FMemory@Unreal@RC@@SAXPEAX@Z
+        __declspec(dllimport) static auto Free(void* original) -> void;
+    };
+
     namespace UObjectGlobals
     {
         // UE4SS.def:1124  UObject* FindFirstOf(const wchar_t*)

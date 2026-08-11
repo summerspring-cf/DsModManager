@@ -169,18 +169,27 @@ the identical archive, neither of which needs an account:
 
 | Source | |
 |---|---|
-| **GitHub Releases** | <https://github.com/summerspring-cf/DsModManager-Release/releases/tag/v0.30> — canonical (release archives live in a separate repository) |
+| **GitHub Releases** | <https://github.com/summerspring-cf/DsModManager-Release/releases/tag/v0.40> — canonical (release archives live in a separate repository) |
 | **Hangul Patch Studio** | <https://hangulpatchstudio.com/g/%EB%93%9C%EB%9E%98%EA%B3%A4%EC%86%8C%EB%93%9C-%EB%AA%A8%EB%93%9C%EB%A7%A4%EB%8B%88%EC%A0%80> — my own distribution page. The page text is Korean, but the download is a direct link and needs no login or registration. |
 
-Both serve `DsCppModManager_0.30.zip`. Verify whichever you download against the hash below;
-if they ever disagree, the GitHub Release is authoritative.
+Verify whichever you download against the hashes below; if they ever disagree, the GitHub
+Release is authoritative.
 
-| File in `DsCppModManager_0.30.zip` | Size (bytes) | SHA-256 |
+**All-in-one — `DsCppModManager_0.40.zip`** (UE4SS bundled):
+
+| File | Size (bytes) | SHA-256 |
 |---|---|---|
-| *(the archive itself)* | 7,322,855 | `a5ca651e95d37634b669b31a65a9eb78fc31f6449a6504aed246cbd2dee9cbf3` |
-| `DsCppModManager/dlls/main.dll` | 224,768 | `f98d63242aaff6d4008d0debb6680880493caa7201e99d971f88a625d6d4250b` |
+| *(the archive itself)* | 7,372,473 | `845ff7f735a6e6c226d8d8490645225064e3a36768fb2c67f730d79de5209da0` |
+| `DsCppModManager/dlls/main.dll` | 276,992 | `c169def1555d2f57f8c65ddeea2523422c9ae7e71f0e6c4dfd3e3591ac7acfea` |
 | `UE4SS/ue4ss/UE4SS.dll` | 16,519,168 | `d0107f63e567313cb6a15c505b5db2bdba38130964a04e019bda7611c6178022` |
 | `UE4SS/dwmapi.dll` | 71,680 | `cfbd121b9e464b3ff35baba0f065d860aaffa7eb90f703748cd8e5b7730fa97e` |
+
+**No-UE4SS — `DsCppModManager-NoUE4SS_0.40.zip`** (contains no UE4SS; 100 % my code):
+
+| File | Size (bytes) | SHA-256 |
+|---|---|---|
+| *(the archive itself)* | 192,410 | `156f23fbde6200c0c70ee9197f59bd05f974d6ad4e777821df67103eb0247569` |
+| `DsCppModManager/dlls/main.dll` | 276,992 | `c169def1555d2f57f8c65ddeea2523422c9ae7e71f0e6c4dfd3e3591ac7acfea` |
 
 The bundled UE4SS source archive in this repository:
 

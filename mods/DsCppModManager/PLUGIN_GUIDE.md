@@ -26,9 +26,12 @@ plugins\
    └─ 무언가_P.pak      ← .pak 하나면 충분 (.ucas/.utoc/.sig 동반 가능)
 ```
 
-- 켜면 `Content\Paks\LogicMods\` 에 **하드링크**로 연결됩니다(사본 아님).
-- 에셋 교체용이면 `dsplugin.ini` 의 `[plugin]` 에 `pak_target=paks` 를 적으세요
-  → `Content\Paks\~mods\` 로 갑니다. 기본값은 `logicmods` 입니다.
+- 켜면 **하드링크**로 연결됩니다(사본 아님). 기본 목적지는 `Content\Paks\~mods\`
+  입니다 — 엔진이 에셋 교체용으로 마운트하는 안전한 위치입니다(대부분의 캐릭터·에셋
+  `_P` 팩이 여기).
+- **블루프린트 로직 모드**(BPModLoaderMod 가 로드하는)만 `[plugin]` 에
+  `pak_target=logicmods` 를 적으세요 → `Content\Paks\LogicMods\` 로 갑니다.
+  ⚠ 에셋 팩을 LogicMods 에 넣으면 BPModLoaderMod 가 BP 모드로 로드하려다 **크래시**합니다.
 - pak 은 게임 시작 때 마운트되므로 **런타임 켬/끔이 없습니다**(재시작 필요).
   `dsruntime.txt` 폴링은 의미가 없으니 구현하지 않아도 됩니다.
 
@@ -312,6 +315,45 @@ end
 - 기본 문구는 `『모드 표시명』 변경 사항은 게임 재시작 후 적용됩니다.`
 - C++ 모드는 같은 파일을 직접 쓰면 됩니다 (한 줄 fwrite)
 - 신호 감지는 타이틀 화면에서 동작합니다 (매니저 활동 구간)
+
+## 5-1. 매니저 표시 언어 따라가기 (v0.40, 선택)
+
+매니저 UI 는 한국어/English 를 지원하고, 현재 언어를 **`Mods\DsCppModManager\dsmmlang.txt`**
+("ko" 또는 "en") 에 방송합니다. 모드가 다국어 문구를 갖고 있다면 이 파일을 읽어
+매니저와 언어를 맞출 수 있습니다 — 사용자가 매니저에서 언어를 바꾸거나 게임 언어를
+바꾸면 2초 안에 갱신됩니다.
+
+```lua
+local mm = require("dsmm_options")
+local L = (mm.lang() == "en")
+    and { found = "Chest found!" }
+    or  { found = "상자 발견!" }
+```
+
+- 경로는 자기 모드 폴더 기준 `..\DsCppModManager\dsmmlang.txt` 입니다
+  (동봉 헬퍼 `mm.lang()` 이 이 계산을 해 줍니다. C++ 은 같은 경로를 fopen)
+- 파일이 없으면(구버전 매니저) "ko" 로 간주하세요
+- **의무가 아닙니다** — 단일 언어 모드는 그냥 무시하면 됩니다
+
+**패널 라벨을 두 언어로 싣기 (`_en` 변형 키)** — 매니페스트에 영어 변형을 함께
+선언하면 매니저가 언어에 맞는 쪽을 골라 그립니다. 패널을 지을 때 고르므로 언어
+전환과 **같은 프레임**에 바뀝니다 (파일을 고쳐 갈아끼울 필요가 없습니다):
+
+```ini
+[plugin]
+name=음식 자동스왑(DsAutoFood)
+name_en=Auto Food Swap (DsAutoFood)
+
+[option:slot4kind]
+label=음식 종류
+label_en=Food Type
+choices=아무거나, 체력 회복만, 부활만
+choices_en=Anything, HP Recovery Only, Revive Only
+```
+
+- 지원 키: `name_en` · `label_en` · `choices_en` · `button_en` (전부 선택 사항)
+- ⚠ `choices_en` 은 원본과 **항목 수·순서가 같아야** 합니다 (저장값 = 0기준 인덱스)
+- `_en` 이 없으면 원본 값을 그대로 씁니다 — 단일 언어 모드는 아무것도 할 필요 없음
 
 ## 6. 동작 규칙 요약
 

@@ -24,7 +24,12 @@ It is a pure C++ UE4SS mod. It manages **Lua mods, C++ mods and `.pak` content m
 ## Downloads
 
 Users do not need this repository. Grab the archive, extract it, and run `install.bat`.
-**UE4SS is bundled** — nothing else to download.
+
+Two builds are published for each release:
+
+- **`DsCppModManager_<ver>.zip`** — all-in-one, **UE4SS bundled**. Nothing else to download.
+- **`DsCppModManager-NoUE4SS_<ver>.zip`** — for players who already run UE4SS. Tiny; its
+  `install.bat` stops with a message if UE4SS isn't installed yet.
 
 | Source | Notes |
 |---|---|
