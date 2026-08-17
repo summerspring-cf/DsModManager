@@ -47,6 +47,8 @@
 #include <shellapi.h>
 #include <xinput.h>
 #pragma comment(lib, "xinput.lib")   // v0.40(pad): 정적 링크 -- LoadLibrary 금지(SECURITY.md 계약)
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")    // v0.50: 입력 진단 -- 레거시 조이스틱 API(XInput 밖 장치 식별)
 #include <stdio.h>
 #include <stdarg.h>
 
@@ -329,9 +331,16 @@ static const wchar_t* trLabel() { return TR(L"모드매니저", L"ModManager"); 
 static void* g_langHs = nullptr;   // v0.40: [기본] 언어 콤보 알약 (히트 대상)
 static void* g_langTx = nullptr;
 static wchar_t g_langChoices[2][24] = {L"한국어(Korean)", L"English"};
-static const wchar_t* const MOD_VER_W = L"v0.40";
+static const wchar_t* const MOD_VER_W = L"v0.50";
 static void* g_padIcon = nullptr;     // 11b: 클론 항목의 패드 Y 아이콘 위젯(SizeBox).
                                       // 패드 사용 중에만 보인다(키퍼가 가시성 토글).
+static void* g_popupPadIcon = nullptr;  // v0.50: 팝업 확인버튼 (A) 아이콘 (패드 시만)
+static void* g_padIconSpacer = nullptr; // v0.50b: Y아이콘 간격자(언어별 폭 갱신용)
+// v0.50b: 게임 네이티브 확정 편승 -- 클론이 맨 아래일 때 게임/Slate 내비가 클론을
+// 실제로 선택하고(라이브 확정 00:24), A/클릭 확정은 DTitleMenuUserWidget 의
+// OnClickedButton(PE 실측)으로 온다. 포인터 비교로 잡아 패널을 연다.
+static std::atomic<void*> g_fnItemClicked{nullptr};
+static std::atomic<unsigned long long> g_cloneClickedMs{0};
 
 /*
   ⚠ IsInGameThread() 크래시 실측 (2026-08-04 14:19, 콜스택 판독):
@@ -387,6 +396,11 @@ struct PlgOpt
     void* sliderFill;  // v0.29: 슬라이더 '채워진' 구간 SizeBox (폭으로 손잡이를 옮긴다)
     void* sliderRest;  // v0.29: '남은' 구간 SizeBox
     wchar_t btnCap[24];// v0.29: button= 캡션 (없으면 '실행')
+    // v0.50: config.ini 브리지 -- 값 저장이 dsoptions 가 아니라 config.ini 로 감
+    bool iniBacked;      // true = 이 옵션은 config.ini 에서 왔다
+    bool iniHeader;      // true = 섹션 제목/안내 행 (type 7, 컨트롤 없음)
+    char iniSection[24]; // config.ini 섹션명 (제자리 저장에 사용)
+    int  iniOrigVal;     // v0.50: 로드 당시 값 -- 저장은 바뀐 키만(남의 줄 보존)
 };
 
 /* ======================= v0.28: 키 바인딩 · 색상 =========================
@@ -471,6 +485,10 @@ static void hsvToRgb(float h, float s, float v, int* r, int* g, int* b)
     *b = (int)((bb + m) * 255 + 0.5f);
 }
 
+// v0.50: 옵션 배열 상한. dsplugin.ini 계약은 여전히 16개(문서화된 값)지만,
+// config.ini 브리지는 섹션 제목행 + 키를 전부 노출하므로 배열은 넉넉히 잡는다.
+// 정적 메모리 비용뿐(PlgRow ~55KB x 50 = ~2.8MB, 전부 static).
+#define MM_MAX_OPT 64
 // v0.6: 플러그인 토글 행 상태 (패널 수명 동안만 유효, 게임 스레드 전용)
 struct PlgRow
 {
@@ -488,7 +506,8 @@ struct PlgRow
     char rtkey[32];  // v0.10: 매니페스트 runtime_key (없으면 빈 문자열 -> 내장표)
     int optN;
     void* expandHs;   // v0.16: 옵션 '펼치기/접기' 행 히트스팟 (접힘 UI 없으면 null)
-    PlgOpt opt[16];   // v0.16: 4 -> 16 (보이는 옵션 5개 초과는 접힘 UI 로 처리)
+    bool iniBridge;   // v0.50: config.ini 브리지 모드 (저장이 config.ini 로 감)
+    PlgOpt opt[MM_MAX_OPT];  // v0.16: 4->16, v0.50: 브리지 위해 MM_MAX_OPT
 };
 // v0.19.1: 표시 한도 8 -> 32. 옛 8 은 행이 단순하던 v0.5 시절의 임의값이었고
 // (기술적 근거 없음), 실사용에서 정확히 8개에 도달했다. 초과분은 로그만 남기고
@@ -582,6 +601,26 @@ static std::atomic<void*> g_selEvtItem{nullptr};
 static std::atomic<unsigned char> g_selEvtOn{0};
 static std::atomic<void*> g_menuOption{nullptr};   // '설정' 항목 (클론 원형 sample)
 static std::atomic<void*> g_menuExit{nullptr};     // '나가기' 항목
+// v0.50: 위치 원복 -- 클론을 설정<->나가기 사이로. Exit 를 remove+readd 하면 게임이
+// 로컬라이즈한 Exit 라벨이 위젯 기본값으로 되돌아간다(영어판 "나가기"·한국판 "Quit"
+// 실측). 그래서 게임 로컬라이즈가 "안정"(라벨 무변화 1.2초)된 뒤에 재정렬하고, 그
+// 순간의 라벨을 캡처해 복원한다. 이후 언어 전환은 게임이 제 항목을 재로컬라이즈하므로
+// (Continue/Settings 가 전환 따라가는 실측) 1회 복원으로 충분하다.
+static bool g_reorderPending = false;
+static unsigned char g_reorderLastExit[24] = {0};
+static bool g_reorderHaveLast = false;
+static ULONGLONG g_reorderStableSince = 0;
+// v0.50: 정렬 전 은신 -- 클론이 잠깐 맨 아래에 보였다가 위로 점프하는 증상 제거.
+// finishClone 이 Collapsed(1) 로 숨기고, 재정렬 완료/실패/시간초과 때 Visible(0) 복귀.
+// 시간초과는 벽시계가 아니라 **게이트(팝업·패널 닫힘)가 열린 틱 수**로 센다 --
+// 라이브 실측(20:46): 안전모드 팝업을 읽는 2분 동안 벽시계가 다 흘러, 닫자마자
+// 즉시 타임아웃 -> 맨 아래 표시됐다. 틱 카운트는 팝업이 열려 있으면 안 는다.
+static int g_reorderOpenTicks = 0;
+// v0.50(리뷰 C-2): RemoveChild(Exit) 성공 후 AddChild 가 실패하면 Exit(나가기)가
+// 메뉴에서 떨어진 채 남는다 -- 붙을 때까지 틱마다 재시도하는 수리 모드.
+static bool g_reorderRepair = false;
+static unsigned char g_reorderSavedLabel[24] = {0};  // 떼기 직전 캡처한 Exit 라벨
+static bool g_reorderHaveSaved = false;
 // 패널 패드 내비게이션: openPanel 이 행을 만들며 등록하는 목록
 struct NavItem
 {
@@ -628,6 +667,10 @@ static bool g_restoreWaitDir = false;          // 10차: 지연 복구가 방향
 static bool g_vstop = false;                   // 10차: 가상 정지 -- 클론을 '선택'으로 표시하고
                                                // 게임 입력을 UIOnly 로 동결한 상태 (편입 폴백)
 static void* g_vstopGameSel = nullptr;         // 동결 순간 게임이 선택 중이던 항목 (복원용)
+static const bool g_adoptEnabled = false;      // v0.50f: 편입(배열 부트스트랩/append) 홀드
+                                               // -- 사용자 지시(2026-08-12). 라이브 5회
+                                               // 시도에도 부팅 경로 순회에 반영 안 됨.
+                                               // 재개 시 이 스위치만 켜면 전부 살아난다.
 static const bool g_vstopEnabled = false;      // 10차f: 동결 방식 봉인 -- 게임과 경합해
                                                // 폭주(연속 자동 이동) 실측. 내비 그래프
                                                // 편입으로 전환한다. 코드는 참고용으로 유지.
@@ -725,7 +768,9 @@ static void clearDragScroll()
 }
 
 // v0.7: 이번 세션에 UE4SS 가 실제 시작한 모드 스냅샷 (UE4SS.log 파싱, 패널 열 때 갱신)
-static wchar_t g_loaded[32][64];
+// v0.50: 32 -> 96 (UE4SS 내장 ~10개와 상한을 나눠 쓰므로 플러그인 몫이 모자랐다
+// -- 넘치면 sessionLoaded 오판 = '재시작 필요' 배지·팝업 오발)
+static wchar_t g_loaded[96][64];
 static int g_loadedN = 0;
 static std::vector<void*> g_siblings;              // 런타임 메뉴 항목 캐시 (clearOthers 용)
 static bool g_reflFault = false;                   // 이번 틱에 리플렉션 SEH 폴트 발생 (게임 스레드 전용)
@@ -1066,6 +1111,401 @@ static bool pathExistsW(const wchar_t* p)
     return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES;
 }
 
+/* ============ v0.50: 입력 진단 로그 (inputlog\YYYYMMDD.log) ==================
+   "모드매니저를 깔면 스팀 컨트롤러를 인식 못 한다" 제보(2026-08-16) 조사용.
+   매니저 코드에는 게임의 패드 인식을 끊을 경로가 없다(XInput '읽기'만 하고
+   XInputEnable·입력 훅·RawInput 등록이 없다) -- 그래서 **무엇이 실제로 들어오고
+   있는지**를 기록해 판단 근거를 만든다.
+
+   파일 이름 규칙 (사용자 지시): 세션 시작 때 그날 날짜로 정하고 **그대로 고정**.
+   자정을 넘겨도 같은 파일에 이어 쓰고(한 세션 = 한 파일), 게임을 껐다 새로 켜면
+   그때 날짜로 새 파일. 같은 날 여러 번 켜면 같은 파일에 이어 붙는다.
+
+   남기는 것: 전경 여부 · XInput 슬롯/능력(가상패드 식별) · 버튼/스틱/트리거 변화 ·
+   패킷 번호(장치가 살아 있는지) · 키보드 키 · 마우스 버튼 · 레거시 조이스틱 목록
+   (장치 이름이 나온다 -- 스팀 입력이 XInput 밖으로 내보내는 구성이면 여기 잡힌다).
+   부담 방지: 타이틀 화면에서만 · 변화가 있을 때만 · 세션당 줄 수 상한.
+   끄려면 매니저 폴더에 inputlog_off.txt 를 만든다. */
+static bool g_inLogInit = false;
+static bool g_inLogOff = false;
+static wchar_t g_inLogFile[MAX_PATH * 2] = {0};
+static int g_inLogN = 0;
+static const int IN_LOG_MAX = 20000;   // 세션 상한 (약 1~2MB)
+// 리뷰 D1: 키 '이름'을 남기는 것은 inputlog_keys.txt 가 있을 때만 (옵트인).
+// 기본은 초당 **횟수만** 집계한다 -- "키보드 신호가 오고 있다"는 진단에는 그것으로
+// 충분하고, 스팀 오버레이 채팅 같은 내용이 남을 여지가 사라진다.
+static bool g_inLogKeyNames = false;
+static int g_inLogKeyN = 0;                 // 리뷰 D7: 키 예산을 따로 -- 패드 진단이
+static const int IN_LOG_KEY_MAX = 4000;     // 키 폭주에 밀려 끊기지 않게
+
+static void inputLogOpen()
+{
+    if (g_inLogInit) return;
+    g_inLogInit = true;
+    wchar_t p[MAX_PATH * 2];
+    modRootPath(p);
+    // 리뷰 D4: modulePath 실패(경로 260자 초과 등)면 빈 문자열이 온다 -- 그대로 쓰면
+    // 게임 프로세스의 **현재 작업 디렉터리**에 폴더를 만들고 로그를 흘린다.
+    // "전부 게임 폴더 안에만" 약속을 깨므로 그때는 아예 기록하지 않는다.
+    if (!p[0])
+    {
+        g_inLogOff = true;
+        logf("inputlog: 모듈 경로 확인 실패 -- 입력 진단 기록을 하지 않는다");
+        return;
+    }
+    lstrcatW(p, L"inputlog_off.txt");
+    if (pathExistsW(p))
+    {
+        g_inLogOff = true;
+        logf("inputlog: inputlog_off.txt 가 있어 입력 진단 기록을 하지 않는다");
+        return;
+    }
+    // 리뷰 D1: 키 '이름'까지 남기는 것은 옵트인. 기본은 익명 집계(횟수)만 --
+    // 스팀 오버레이(Shift+Tab)는 별도 창을 만들지 않아 게임이 계속 전경이고,
+    // GetAsyncKeyState 는 물리 상태라 오버레이 채팅 타자까지 읽힌다.
+    modRootPath(p);
+    lstrcatW(p, L"inputlog_keys.txt");
+    g_inLogKeyNames = pathExistsW(p);
+    modRootPath(p);
+    lstrcatW(p, L"inputlog");
+    CreateDirectoryW(p, nullptr);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    swprintf(g_inLogFile, MAX_PATH * 2, L"%s\\%04u%02u%02u.log", p,
+             (unsigned)t.wYear, (unsigned)t.wMonth, (unsigned)t.wDay);
+    // 리뷰 D3-①: 같은 날 재실행마다 이어 붙으므로 파일이 무한정 커질 수 있다.
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExW(g_inLogFile, GetFileExInfoStandard, &fa))
+    {
+        ULONGLONG sz = ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+        if (sz > 8ull * 1024 * 1024)
+        {
+            g_inLogOff = true;
+            logf("inputlog: 오늘 파일이 이미 %llu MB -- 이번 실행은 기록하지 않는다",
+                 (unsigned long long)(sz / (1024 * 1024)));
+            return;
+        }
+    }
+    // 리뷰 D3-②: 보존 기간 -- 14일 넘은 날짜 파일은 지운다 (무한 축적 방지)
+    {
+        wchar_t pat[MAX_PATH * 2];
+        swprintf(pat, MAX_PATH * 2, L"%s\\*.log", p);
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE)
+        {
+            FILETIME ftNow;
+            GetSystemTimeAsFileTime(&ftNow);
+            ULONGLONG now100 = ((ULONGLONG)ftNow.dwHighDateTime << 32) | ftNow.dwLowDateTime;
+            const ULONGLONG keep = 14ull * 24 * 60 * 60 * 10000000ull;
+            int cut = 0;
+            do
+            {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                ULONGLONG w = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) |
+                              fd.ftLastWriteTime.dwLowDateTime;
+                if (!w || now100 <= w || now100 - w <= keep) continue;
+                wchar_t old[MAX_PATH * 2];
+                swprintf(old, MAX_PATH * 2, L"%s\\%s", p, fd.cFileName);
+                if (DeleteFileW(old)) ++cut;
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+            if (cut) logf("inputlog: 14일 지난 기록 %d개 정리", cut);
+        }
+    }
+    logf("inputlog: 입력 진단 기록 -> %s (세션 시작 날짜로 고정, 키 이름 기록=%d)",
+         u8(g_inLogFile).c_str(), (int)g_inLogKeyNames);
+}
+
+// ⚠ UpdateThread 전용 (on_update). 다른 스레드에서 부르지 말 것 -- 카운터가 평범한 int 다.
+static void inputLog(const char* fmt, ...)
+{
+    if (g_inLogOff) return;
+    if (!g_inLogInit) inputLogOpen();
+    if (g_inLogOff || !g_inLogFile[0]) return;
+    if (g_inLogN >= IN_LOG_MAX)
+    {
+        if (g_inLogN == IN_LOG_MAX)
+        {
+            ++g_inLogN;   // 한 번만 알린다
+            logf("inputlog: 세션 상한(%d줄) 도달 -- 이후 기록 생략", IN_LOG_MAX);
+        }
+        return;
+    }
+    ++g_inLogN;
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char line[640];
+    int n = snprintf(line, sizeof(line), "%02u:%02u:%02u.%03u %s\r\n",
+                     (unsigned)t.wHour, (unsigned)t.wMinute, (unsigned)t.wSecond,
+                     (unsigned)t.wMilliseconds, msg);
+    if (n <= 0) return;
+    if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;   // snprintf 는 '원래 길이'를 준다
+    HANDLE h = CreateFileW(g_inLogFile, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wr = 0;
+    WriteFile(h, line, (DWORD)n, &wr, nullptr);
+    CloseHandle(h);
+}
+
+/* ====== v0.50: 보조 XInput -- **게임과 같은 눈으로** 패드를 본다 ==============
+   실측(2026-08-16, 리포터 크래시 덤프의 모듈 목록):
+     게임 = C:\Windows\System32\**XINPUT1_3.dll**  (exe 문자열에도 XINPUT1_3.dll)
+     매니저 = C:\Windows\System32\**XINPUT1_4.dll** (정적 링크 xinput.lib)
+   한 프로세스에 두 개가 나란히 올라와 있다. 스팀 입력(Steam Input)이 컨트롤러를
+   에뮬레이트해 주는 경로가 **게임이 쓰는 DLL 쪽에만** 걸려 있으면, 게임은 패드가
+   되는데 매니저만 "장치 없음"이 된다 — 제보 문장과 정확히 같은 그림이다.
+   그래서 기본(1_4)이 아무것도 못 보면 **게임이 이미 로드해 둔** XInput 으로도
+   물어본다. 어느 쪽이 답했는지는 로그에 남긴다.
+   ⚠ SECURITY.md 계약: LoadLibrary 를 쓰지 않는다 — `GetModuleHandleW` 는 **이미
+   로드된** 모듈만 집는다(새 DLL 을 불러오지 않는다). 없으면 그냥 포기한다.
+   ⚠ 미검증 함수 포인터의 첫 호출이므로 SEH 뒤에서 부른다(전사 규율). */
+typedef DWORD(WINAPI* PFN_XInputGetState)(DWORD, XINPUT_STATE*);
+static PFN_XInputGetState g_xiAlt = nullptr;
+static const wchar_t* g_xiAltName = nullptr;
+static bool g_xiAltTried = false;
+
+static void xiAltResolve()
+{
+    if (g_xiAltTried) return;
+    g_xiAltTried = true;
+    static const wchar_t* const CANDS[] = {
+        L"XINPUT1_3.dll", L"XINPUT9_1_0.dll", L"XINPUT1_2.dll", L"XINPUT1_1.dll"
+    };
+    for (const wchar_t* nm : CANDS)
+    {
+        HMODULE h = GetModuleHandleW(nm);   // 이미 로드된 것만 (LoadLibrary 아님)
+        if (!h) continue;
+        FARPROC p = GetProcAddress(h, "XInputGetState");
+        // 이름이 없으면 서수 100 = XInputGetStateEx (문서 외, 가이드 버튼까지 준다.
+        // 구조체 레이아웃은 XINPUT_STATE 와 같다 -- 게임들이 흔히 쓰는 경로)
+        if (!p) p = GetProcAddress(h, (LPCSTR)(uintptr_t)100);
+        if (!p) continue;
+        g_xiAlt = (PFN_XInputGetState)p;
+        g_xiAltName = nm;
+        logf("pad: 보조 XInput 확보 -- %s (게임이 이미 로드해 둔 것)", u8(nm).c_str());
+        return;
+    }
+    logf("pad: 보조 XInput 없음 (XINPUT1_3/9_1_0 미로드)");
+}
+
+// ⚠ 오브젝트 소멸자가 없는 함수여야 __try 가 성립한다(C2712)
+static DWORD xiAltGetState(DWORD idx, XINPUT_STATE* st)
+{
+    if (!g_xiAlt) return ERROR_DEVICE_NOT_CONNECTED;
+    __try
+    {
+        return g_xiAlt(idx, st);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        g_xiAlt = nullptr;   // 한 번이라도 튀면 영구 포기
+        return ERROR_DEVICE_NOT_CONNECTED;
+    }
+}
+
+// 레거시 조이스틱 목록 (XInput 에 안 잡히는 장치를 이름으로 식별). 반환 = 발견 수.
+static int inputLogJoysticks()
+{
+    // 리뷰 D5: 꺼져 있으면 열거 자체를 하지 않는다 ("끄면 아무것도 안 한다" 계약)
+    if (!g_inLogInit) inputLogOpen();
+    if (g_inLogOff) return 0;
+    UINT nd = joyGetNumDevs();
+    if (nd > 8) nd = 8;   // 열거 비용 상한
+    int found = 0;
+    for (UINT i = 0; i < nd; ++i)
+    {
+        JOYINFOEX ji;
+        memset(&ji, 0, sizeof(ji));
+        ji.dwSize = sizeof(ji);
+        ji.dwFlags = JOY_RETURNBUTTONS | JOY_RETURNX | JOY_RETURNY;
+        if (joyGetPosEx(i, &ji) != JOYERR_NOERROR) continue;
+        ++found;
+        JOYCAPSW jc;
+        memset(&jc, 0, sizeof(jc));
+        if (joyGetDevCapsW(i, &jc, sizeof(jc)) == JOYERR_NOERROR)
+        {   // szPname 은 드라이버가 종단 NUL 없이 32자를 채울 수 있다 -- 길이를 못박는다
+            std::wstring nm(jc.szPname, wcsnlen(jc.szPname, 32));
+            inputLog("joy[%u]: '%s' 버튼=%u 축=%u (VID=%04X PID=%04X)", i,
+                     u8(nm).c_str(), jc.wNumButtons, jc.wNumAxes, jc.wMid, jc.wPid);
+        }
+        else
+            inputLog("joy[%u]: 연결됨 (이름 조회 실패)", i);
+    }
+    if (!found) inputLog("joy: 레거시 조이스틱 API 에도 장치 없음 (검사 %u개)", nd);
+    return found;
+}
+
+/* v0.50: 환경 지문 -- 세션당 1회, 전부 **읽기 전용**. 이 네 덩어리면 "스팀 컨트롤러가
+   왜 안 보이나"가 사용자 로그 하나로 갈린다 (조사 2026-08-17 권고).
+   ① 스팀 오버레이 주입 여부 -- 없으면 스팀을 거치지 않은 실행이거나 오버레이 꺼짐.
+      Windows 에서 에뮬 패드는 **오버레이가 만든다**. 없으면 패드도 없다(원인 확정).
+   ② SteamAppId 등 환경변수 -- 스팀이 띄운 프로세스인지.
+   ③ SteamVirtualGamepadInfo -- 스팀이 이 프로세스에 광고하는 가상 패드 목록
+      (슬롯/이름/VID/PID 가 그대로 들어 있다. SDL 이 실제로 읽는 경로).
+   ④ 로드된 XInput 모듈 + **훅 지문** -- 함수 앞 바이트가 E9/FF25(점프)면 스팀이
+      훅한 것, 원본 프롤로그면 미훅. "우리 1_4 는 미훅인데 게임 1_3 은 훅됨"이
+      보이면 원인 확정. */
+static std::string readFileA(const wchar_t* path);   // 정의는 아래 (파일 순서 때문)
+
+static void inputLogEnvFingerprint()
+{
+    // ① 오버레이
+    {
+        static const wchar_t* const OV[] = {L"GameOverlayRenderer64.dll", L"GameOverlayRenderer.dll"};
+        bool any = false;
+        for (const wchar_t* n : OV)
+            if (GetModuleHandleW(n)) { any = true; inputLog("환경: 스팀 오버레이 주입됨 (%s)", u8(n).c_str()); }
+        if (!any)
+            inputLog("환경: ⚠ 스팀 오버레이가 주입되지 않았다 -- 스팀을 거치지 않고 실행했거나 "
+                     "오버레이가 꺼져 있다. 이 경우 스팀 컨트롤러는 어떤 게임에도 패드로 보이지 않는다");
+    }
+    // ② 스팀 환경변수
+    {
+        static const wchar_t* const EV[] = {L"SteamAppId", L"SteamGameId", L"SteamOverlayGameId"};
+        wchar_t buf[128];
+        bool any = false;
+        for (const wchar_t* n : EV)
+            if (GetEnvironmentVariableW(n, buf, 128))
+            { any = true; inputLog("환경: %s=%s", u8(n).c_str(), u8(buf).c_str()); }
+        if (!any) inputLog("환경: ⚠ 스팀 환경변수 없음 -- 스팀이 띄운 프로세스가 아니다");
+    }
+    // ③ 스팀 가상 패드 광고 파일
+    {
+        wchar_t p[MAX_PATH * 2];
+        DWORD n = GetEnvironmentVariableW(L"SteamVirtualGamepadInfo", p, MAX_PATH * 2);
+        if (n && n < MAX_PATH * 2)
+        {
+            inputLog("환경: SteamVirtualGamepadInfo=%s", u8(p).c_str());
+            std::string d = readFileA(p);
+            if (d.empty()) inputLog("환경: 가상패드 목록 파일이 비었거나 못 읽음");
+            else
+            {
+                size_t pos = 0;
+                int lines = 0;
+                while (pos < d.size() && lines < 40)
+                {
+                    size_t eol = d.find('\n', pos);
+                    if (eol == std::string::npos) eol = d.size();
+                    std::string ln = d.substr(pos, eol - pos);
+                    pos = eol + 1;
+                    while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ')) ln.pop_back();
+                    if (ln.empty()) continue;
+                    ++lines;
+                    inputLog("  가상패드| %.200s", ln.c_str());
+                }
+            }
+        }
+        else inputLog("환경: SteamVirtualGamepadInfo 없음 (스팀이 가상 패드를 광고하지 않는다)");
+    }
+    // ④ XInput 모듈 + 훅 지문
+    {
+        static const wchar_t* const XI[] = {
+            L"XINPUT1_4.dll", L"XINPUT1_3.dll", L"XINPUT9_1_0.dll", L"XINPUT1_2.dll", L"XINPUT1_1.dll"
+        };
+        for (const wchar_t* n : XI)
+        {
+            HMODULE h = GetModuleHandleW(n);
+            if (!h) { inputLog("환경: %s 미로드", u8(n).c_str()); continue; }
+            FARPROC p = GetProcAddress(h, "XInputGetState");
+            if (!p) p = GetProcAddress(h, (LPCSTR)(uintptr_t)2);
+            if (!p) { inputLog("환경: %s 로드됨 (XInputGetState 없음)", u8(n).c_str()); continue; }
+            unsigned char b[8] = {0};
+            memcpy(b, (const void*)p, 8);   // 코드 페이지 읽기 (실행 가능 = 읽기 가능)
+            bool hooked = (b[0] == 0xE9) || (b[0] == 0xFF && b[1] == 0x25) ||
+                          (b[0] == 0xEB) || (b[0] == 0x48 && b[1] == 0xB8 && b[2] == 0x00);
+            inputLog("환경: %s 로드됨 진입부=%02X %02X %02X %02X %02X %02X %02X %02X -> %s",
+                     u8(n).c_str(), b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                     hooked ? "훅 걸림(스팀 등이 가로챔)" : "원본(훅 없음)");
+        }
+    }
+}
+
+/* 전경/타이틀 전환 + 키보드·마우스 입력 기록.
+   ⚠ 기록 범위를 **타이틀 화면 + 게임 창이 앞에 있을 때**로 못박는다:
+   인게임 조작이나 다른 창에 치는 타자는 남기지 않는다(그럴 이유도 없고, 남기면
+   안 된다). 타이틀에는 글자 입력 칸이 없어 개인적인 내용이 찍힐 여지도 없다.
+   남기는 것은 키 '이름'뿐이고, 매니저 폴더의 로그 파일 밖으로 나가지 않는다. */
+static void inputDiagTick(bool fgOurs, bool atTitle)
+{
+    static bool s_first = true, s_lastFg = false, s_lastTitle = false;
+    static ULONGLONG s_lastKbMs = 0;
+    static unsigned char s_kbPrev[256] = {0};
+    if (g_inLogOff) return;
+    ULONGLONG now = GetTickCount64();
+    if (atTitle != s_lastTitle)
+    {
+        s_lastTitle = atTitle;
+        if (atTitle)
+        {
+            if (s_first)
+            {
+                s_first = false;
+                inputLog("================ 세션 시작 (모드매니저 %s) ================",
+                         u8(MOD_VER_W).c_str());
+                inputLog("기록 범위: 타이틀 화면 + 게임 창이 앞에 있을 때만. 끄려면 매니저 "
+                         "폴더에 inputlog_off.txt 를 만드세요.");
+                inputLogEnvFingerprint();   // v0.50: 세션 1회 환경 지문 (읽기 전용)
+                inputLogJoysticks();
+            }
+            inputLog("--- 타이틀 진입 ---");
+        }
+        else inputLog("--- 타이틀 이탈 (게임 로딩/종료) ---");
+        memset(s_kbPrev, 0, sizeof(s_kbPrev));   // 경계에서 유령 엣지 방지
+    }
+    if (!atTitle) return;
+    if (fgOurs != s_lastFg)
+    {
+        s_lastFg = fgOurs;
+        inputLog("창 포커스: %s%s", fgOurs ? "게임 앞으로" : "게임 뒤로",
+                 fgOurs ? "" : " (이 동안의 입력은 기록하지 않음)");
+        if (!fgOurs) memset(s_kbPrev, 0, sizeof(s_kbPrev));
+    }
+    if (!fgOurs) return;
+    if (g_inLogKeyN >= IN_LOG_KEY_MAX) return;   // 리뷰 D7: 키 예산 소진 -- 패드 진단은 계속
+    if (now - s_lastKbMs < 50) return;   // 50ms 간격 (전체 가상키 훑기 비용 억제)
+    s_lastKbMs = now;
+    static ULONGLONG s_aggUntil = 0;
+    static int s_aggDown = 0, s_aggUp = 0;
+    for (int vk = 0x01; vk <= 0xFE; ++vk)
+    {
+        bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        if (down == (s_kbPrev[vk] != 0)) continue;
+        s_kbPrev[vk] = down ? 1 : 0;
+        if (g_inLogKeyNames)
+        {   // 옵트인: 키 이름까지 (깊은 진단용 -- inputlog_keys.txt)
+            ++g_inLogKeyN;
+            wchar_t kn[64];
+            keyName(vk, kn, 64);
+            inputLog("%s vk=0x%02X (%s)", down ? "키 누름" : "키 뗌 ", vk, u8(kn).c_str());
+        }
+        else
+        {   // 기본: 무엇을 눌렀는지는 남기지 않고 **횟수만** 1초 단위로 모아 적는다.
+            // "키보드 신호가 오고 있다"(스팀 입력이 패드를 키보드로 바꾸는 구성)를
+            // 판별하는 데는 이것으로 충분하다.
+            if (down) ++s_aggDown; else ++s_aggUp;
+            if (!s_aggUntil) s_aggUntil = now + 1000;
+        }
+    }
+    if (s_aggUntil && now >= s_aggUntil)
+    {
+        if (s_aggDown || s_aggUp)
+        {
+            ++g_inLogKeyN;
+            inputLog("키보드 입력 감지: 누름 %d회 뗌 %d회 (1초) -- 어떤 키인지는 남기지 "
+                     "않습니다. 필요하면 inputlog_keys.txt 를 만드세요", s_aggDown, s_aggUp);
+        }
+        s_aggDown = s_aggUp = 0;
+        s_aggUntil = 0;
+    }
+}
+
 static bool copyDirRecursive(const wchar_t* src, const wchar_t* dst)
 {
     CreateDirectoryW(dst, nullptr);
@@ -1238,7 +1678,7 @@ static void loadSessionMods()
     for (int pi = 0; pi < 3; ++pi)
     {
         size_t pos = 0;
-        while (g_loadedN < 32)
+        while (g_loadedN < 96)
         {
             pos = log.find(pats[pi], pos);
             if (pos == std::string::npos) break;
@@ -1432,15 +1872,233 @@ static std::string iniValueLang(const std::string& ini, const char* sec, const c
     return iniValue(ini, sec, key);
 }
 
+// ======================= v0.50: config.ini 브리지 =========================
+// 서드파티 모드가 dsplugin.ini 옵션을 하나도 선언하지 않았지만 config.ini 로
+// 설정을 받는 경우(예: 대화 초상화 오버레이), 그 config.ini 값을 이 패널에서
+// 바로 편집하게 한다. 사용자 결정(2026-08-12): "있는 것 전부 노출".
+//   [섹션] 줄  = 안내/제목 행(type 7, 컨트롤 없음)
+//   값 0/1     = 토글, 정수 = 스테퍼, 그 외(실수/문자열) = 읽기 전용 표시(type 7)
+//   저장       = config.ini 제자리(값 토막만 교체, 주석/순서/나머지 전부 보존)
+// dsplugin.ini 옵션이 하나라도 있으면 브리지하지 않는다(모드 계약 우선).
+// config.ini 위치: 플러그인 폴더 루트 우선, 없으면 Scripts\ 하위.
+static bool iniBridgeFilePath(PlgRow& r, wchar_t* out)
+{
+    const wchar_t* base = r.rel[0] ? r.rel : r.name;
+    const wchar_t* subs[] = { L"\\config.ini", L"\\Scripts\\config.ini", L"\\scripts\\config.ini" };
+    for (const wchar_t* sub : subs)
+    {
+        pluginSrcPath(out, base);
+        lstrcatW(out, sub);
+        if (pathExistsW(out)) return true;
+    }
+    return false;
+}
+
+// 정수 리터럴인가 (앞뒤 공백 제거된 문자열, 부호 허용)
+static bool isIntLiteral(const std::string& v)
+{
+    if (v.empty()) return false;
+    size_t i = 0;
+    if (v[i] == '+' || v[i] == '-') ++i;
+    if (i >= v.size()) return false;
+    for (; i < v.size(); ++i) if (v[i] < '0' || v[i] > '9') return false;
+    return true;
+}
+
+// v0.50: 값이 int32 로 '왕복'되는 표준 정수인가. 왕복이 안 되면(앞자리 0, 선행 +,
+// int32 범위 초과) atoi/"%d" 저장이 원문을 바꿔버리므로(007->7, 4294967295 오버플로,
+// SteamID64 손상) 편집 대상에서 빼고 표시 전용(type 7)으로 돌린다. 리뷰 확정 2건의 뿌리.
+static bool parseInt32Exact(const std::string& v, int* out)
+{
+    if (!isIntLiteral(v)) return false;
+    char* end = nullptr;
+    long long ll = strtoll(v.c_str(), &end, 10);
+    if (!end || *end != 0) return false;
+    if (ll < -2147483647LL - 1 || ll > 2147483647LL) return false;
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", (int)ll);
+    if (v != buf) return false;   // 표준형이 아니면(앞0·+부호 등) 거부
+    *out = (int)ll;
+    return true;
+}
+
+// config.ini 제자리 저장 -- 값 토막만 교체(키/주석/순서/나머지 보존). true=교체함.
+static bool iniReplaceValue(std::string& data, const char* section, const char* key, const std::string& newVal)
+{
+    std::string sec = std::string("[") + section + "]";
+    size_t pos = 0;
+    bool inSec = false;
+    while (pos < data.size())
+    {
+        size_t eol = data.find('\n', pos);
+        size_t lineEnd = (eol == std::string::npos) ? data.size() : eol;
+        size_t s = pos, e = lineEnd;
+        while (s < e && (data[s] == ' ' || data[s] == '\t')) ++s;
+        size_t te = e;
+        while (te > s && (data[te - 1] == '\r' || data[te - 1] == ' ' || data[te - 1] == '\t')) --te;
+        if (te > s)
+        {
+            if (data[s] == '[')
+                inSec = (te - s == sec.size()) && data.compare(s, sec.size(), sec) == 0;
+            else if (inSec && data[s] != ';' && data[s] != '#')
+            {
+                size_t eq = data.find('=', s);
+                if (eq != std::string::npos && eq < te)
+                {
+                    size_t ke = eq;
+                    while (ke > s && (data[ke - 1] == ' ' || data[ke - 1] == '\t')) --ke;
+                    if (ke - s == strlen(key) && _strnicmp(data.c_str() + s, key, ke - s) == 0)
+                    {
+                        size_t vs = eq + 1;
+                        while (vs < te && (data[vs] == ' ' || data[vs] == '\t')) ++vs;
+                        data.replace(vs, te - vs, newVal);
+                        return true;
+                    }
+                }
+            }
+        }
+        if (eol == std::string::npos) break;
+        pos = eol + 1;
+    }
+    return false;
+}
+
+static void saveIniBridge(PlgRow& r)
+{
+    wchar_t p[MAX_PATH * 2];
+    if (!iniBridgeFilePath(r, p)) return;
+    std::string data = readFileA(p);
+    if (data.empty()) return;
+    bool bom = (data.size() >= 3 && data.compare(0, 3, "\xEF\xBB\xBF") == 0);
+    std::string body = bom ? data.substr(3) : data;
+    int changed = 0;
+    for (int i = 0; i < r.optN; ++i)
+    {
+        PlgOpt& o = r.opt[i];
+        if (!o.iniBacked || o.iniHeader) continue;
+        if (o.type != 0 && o.type != 1) continue;   // 편집 가능한 것만(표시전용 제외)
+        if (o.val == o.iniOrigVal) continue;         // v0.50: 사용자가 바꾼 키만 기록 -- 남의 줄 보존
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%d", o.val);
+        if (iniReplaceValue(body, o.iniSection, o.key, buf)) { ++changed; o.iniOrigVal = o.val; }
+    }
+    if (changed == 0) return;
+    std::string outp = bom ? (std::string("\xEF\xBB\xBF") + body) : body;
+    HANDLE h = CreateFileW(p, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { logf("WARN iniBridge save: 열기 실패"); return; }
+    DWORD wr = 0;
+    WriteFile(h, outp.data(), (DWORD)outp.size(), &wr, nullptr);
+    CloseHandle(h);
+    logf("iniBridge '%s': config.ini 저장 (%d개 갱신)", u8(r.name).c_str(), changed);
+}
+
+// config.ini 를 읽어 옵션 행을 채운다 (loadManifest 에서 optN==0 일 때만 호출).
+static void loadIniBridge(PlgRow& r)
+{
+    wchar_t p[MAX_PATH * 2];
+    if (!iniBridgeFilePath(r, p)) return;
+    std::string data = readFileA(p);
+    if (data.empty()) return;
+    if (data.size() >= 3 && data.compare(0, 3, "\xEF\xBB\xBF") == 0) data.erase(0, 3);
+
+    int firstKey = r.optN;   // 안내 행 전에 실제 키 개수 판정용
+    // 안내 행 (항상 첫 줄)
+    {
+        PlgOpt& o = r.opt[r.optN];
+        memset(&o, 0, sizeof(o));
+        o.type = 7; o.iniBacked = true; o.iniHeader = true;
+        lstrcpynW(o.label, TR(L"config.ini \u00b7 \uac12 \ubcc0\uacbd \ud6c4 \ubaa8\ub4dc \ub9ac\ub85c\ub4dc/\uc7ac\uc2dc\uc791 \ud544\uc694",
+                              L"config.ini \u00b7 reload or restart the mod after changes"), 48);
+        ++r.optN;
+    }
+
+    std::string curSec;
+    int realKeys = 0;
+    size_t pos = 0;
+    while (pos < data.size() && r.optN < MM_MAX_OPT)
+    {
+        size_t eol = data.find('\n', pos);
+        if (eol == std::string::npos) eol = data.size();
+        size_t s = pos, e = eol;
+        while (s < e && (data[s] == ' ' || data[s] == '\t')) ++s;
+        while (e > s && (data[e - 1] == '\r' || data[e - 1] == ' ' || data[e - 1] == '\t')) --e;
+        pos = eol + 1;
+        if (e <= s) continue;                 // 빈 줄
+        char c0 = data[s];
+        if (c0 == ';' || c0 == '#') continue; // 주석
+        if (c0 == '[')
+        {
+            size_t rb = data.find(']', s);
+            if (rb == std::string::npos || rb >= e) continue;
+            curSec = data.substr(s + 1, rb - s - 1);
+            if (curSec.empty() || curSec.size() >= 24) { curSec.clear(); continue; }
+            PlgOpt& o = r.opt[r.optN];
+            memset(&o, 0, sizeof(o));
+            o.type = 7; o.iniBacked = true; o.iniHeader = true;
+            strncpy_s(o.iniSection, curSec.c_str(), _TRUNCATE);
+            std::string lab = "[" + curSec + "]";
+            utf8ToW(lab, o.label, 48);
+            ++r.optN;
+            continue;
+        }
+        // key=value
+        size_t eq = data.find('=', s);
+        if (eq == std::string::npos || eq >= e) continue;
+        size_t ke = eq;
+        while (ke > s && (data[ke - 1] == ' ' || data[ke - 1] == '\t')) --ke;
+        std::string key = data.substr(s, ke - s);
+        size_t vs = eq + 1;
+        while (vs < e && (data[vs] == ' ' || data[vs] == '\t')) ++vs;
+        std::string val = data.substr(vs, e - vs);
+        if (key.empty() || key.size() >= 32 || curSec.empty()) continue;
+
+        PlgOpt& o = r.opt[r.optN];
+        memset(&o, 0, sizeof(o));
+        o.iniBacked = true;
+        strncpy_s(o.key, key.c_str(), _TRUNCATE);
+        strncpy_s(o.iniSection, curSec.c_str(), _TRUNCATE);
+        int iv = 0;
+        if (val == "0" || val == "1")
+        {
+            o.type = 0; o.minV = 0; o.maxV = 1; o.step = 1; o.val = (val == "1") ? 1 : 0;
+            o.iniOrigVal = o.val;
+            utf8ToW(key, o.label, 48);
+        }
+        else if (parseInt32Exact(val, &iv))   // v0.50: 왕복되는 표준 int32 만 편집 대상
+        {
+            o.type = 1; o.val = iv; o.iniOrigVal = iv;
+            int a = iv < 0 ? -iv : iv;
+            o.step = (a >= 1000) ? 25 : (a >= 100 ? 5 : 1);   // 큰 좌표는 큰 폭으로
+            o.minV = -100000000; o.maxV = 100000000;          // 오버플로 안전한 넉넉한 범위
+            utf8ToW(key, o.label, 48);
+        }
+        else
+        {
+            // 실수/문자열/비표준 정수(큰 수·앞0·부호) = 읽기 전용 표시 (라벨에 값 포함)
+            o.type = 7; o.iniHeader = false;
+            std::string lab = key + " = " + val;
+            utf8ToW(lab, o.label, 48);
+        }
+        ++realKeys;
+        ++r.optN;
+    }
+    if (realKeys == 0) { r.optN = firstKey; return; }   // 키가 없으면 안내/섹션행도 걷어낸다
+    if (r.optN >= MM_MAX_OPT && pos < data.size())      // v0.50: 상한에 걸려 뒷줄이 잘렸다 -- '넣었는데 안 보인다' 방지
+        logf("WARN iniBridge '%s': config.ini 항목이 상한(%d) 초과 -- 뒷부분 잘림", u8(r.name).c_str(), MM_MAX_OPT);
+    r.iniBridge = true;
+    logf("iniBridge '%s': config.ini -> 옵션 %d개 (키 %d)", u8(r.name).c_str(), r.optN - firstKey, realKeys);
+}
+
 static void loadManifest(PlgRow& r)
 {
     r.rtkey[0] = 0;
     r.optN = 0;
+    r.iniBridge = false;  // v0.50
     wchar_t mp[MAX_PATH * 2];
     pluginSrcPath(mp, r.rel[0] ? r.rel : r.name);
     lstrcatW(mp, L"\\dsplugin.ini");
     std::string ini = readFileA(mp);
-    if (ini.empty()) return;
+    if (ini.empty()) { loadIniBridge(r); return; }  // v0.50: config.ini 브리지
     if (ini.size() >= 3 && ini.compare(0, 3, "\xEF\xBB\xBF") == 0) ini.erase(0, 3);
 
     std::string rk = iniValue(ini, "plugin", "runtime_key");
@@ -1543,6 +2201,7 @@ static void loadManifest(PlgRow& r)
         ++r.optN;
         pos = ke;
     }
+    if (r.optN == 0) loadIniBridge(r);  // v0.50: 옵션 미선언 + config.ini 있으면 브리지
     logf("manifest '%s': 표시명=%s rtkey=%s 옵션 %d개", u8(r.name).c_str(),
          r.label[0] ? u8(r.label).c_str() : "(폴더명)",
          r.rtkey[0] ? r.rtkey : "(없음)", r.optN);
@@ -1562,6 +2221,7 @@ static void optionsFilePath(wchar_t* out, const wchar_t* name, const wchar_t* re
 
 static void loadOptionValues(PlgRow& r)
 {
+    if (r.iniBridge) return;   // v0.50: 값은 config.ini 에서 이미 읽음
     wchar_t p[MAX_PATH * 2];
     optionsFilePath(p, r.name, r.rel, true);
     std::string data = readFileA(p);
@@ -1599,6 +2259,7 @@ static void loadOptionValues(PlgRow& r)
 
 static void saveOptionValues(PlgRow& r)
 {
+    if (r.iniBridge) { saveIniBridge(r); return; }   // v0.50: config.ini 제자리 저장
     std::string out;
     for (int i = 0; i < r.optN; ++i)
     {
@@ -2285,9 +2946,107 @@ static void removeModEntry(const wchar_t* name)
     }
 }
 
+/* ================= v0.50(TODO 13): pak 링크 장부 (paklinks.txt) =================
+   실측(넥서스 리포트 2026-08-16): 모드를 업데이트하면 plugins 원본의 파일 실체가
+   바뀌어, ~mods 의 옛 하드링크가 sameFileIdentity 검증(현재 원본과 대조)에 떨어지고
+   "사용자 파일 보호" 분기로 영영 남는다. 실체 대조만으로는 "우리가 건 링크"를
+   업데이트 후에 증명할 수 없다 -- 그래서 걸 때 장부에 적고, 지울 때 장부를 믿는다.
+   형식: <sub>\<파일명>|<크기>|<소유모드폴더명>  (UTF-8 한 줄씩, 관리자 루트에 저장)
+   ⚠ 장부 삭제 검증: 실체 대조 실패 시 "장부에 있고 + 크기 일치"면 우리 잔재로 본다.
+   (사용자가 우리 링크를 지우고 같은 이름·같은 크기의 파일을 손수 둔 경우만 오판
+   가능 -- 내용이 같은 pak 이므로 고유 데이터 손실은 없다. 잔여 위험으로 문서화.) */
+static void pakManifestPath(wchar_t* out)
+{
+    modRootPath(out);
+    lstrcatW(out, L"paklinks.txt");
+}
+
+static ULONGLONG fileSizeOfW(const wchar_t* p)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExW(p, GetFileExInfoStandard, &fa)) return 0;
+    return ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+}
+
+static std::string pakKey(const wchar_t* sub, const wchar_t* file)
+{
+    return u8(sub) + "\\" + u8(file);
+}
+
+// owner 가 null 이면 그 키를 지우고, 아니면 갱신/추가한다 (파일 통째 재작성).
+static void pakManifestPut(const wchar_t* sub, const wchar_t* file, ULONGLONG size,
+                           const wchar_t* owner)
+{
+    wchar_t p[MAX_PATH * 2];
+    pakManifestPath(p);
+    std::string data = readFileA(p);
+    std::string key = pakKey(sub, file);
+    std::string out;
+    size_t pos = 0;
+    while (pos < data.size())
+    {
+        size_t eol = data.find('\n', pos);
+        if (eol == std::string::npos) eol = data.size();
+        std::string ln = data.substr(pos, eol - pos);
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ')) ln.pop_back();
+        size_t bar = ln.find('|');
+        bool same = bar != std::string::npos && bar == key.size() &&
+                    _strnicmp(ln.c_str(), key.c_str(), bar) == 0;
+        if (!ln.empty() && !same) out += ln + "\n";
+        pos = eol + 1;
+    }
+    if (owner)
+    {
+        // 리뷰 D2: 고정 버퍼 금지 -- 한글 파일명은 UTF-8 로 최대 ~780바이트라
+        // snprintf 가 잘라먹으면 항목이 조용히 유실된다(파서가 못 읽는 줄이 됨).
+        char szbuf[24];
+        snprintf(szbuf, sizeof(szbuf), "%llu", (unsigned long long)size);
+        out += key + "|" + szbuf + "|" + u8(owner) + "\n";
+    }
+    HANDLE h = CreateFileW(p, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wr = 0;
+    WriteFile(h, out.data(), (DWORD)out.size(), &wr, nullptr);
+    CloseHandle(h);
+}
+
+// 장부에서 키 조회. 반환 true = 있음 (size/owner 채움).
+static bool pakManifestFind(const wchar_t* sub, const wchar_t* file,
+                            ULONGLONG* sizeOut, std::string* ownerOut)
+{
+    wchar_t p[MAX_PATH * 2];
+    pakManifestPath(p);
+    std::string data = readFileA(p);
+    std::string key = pakKey(sub, file);
+    size_t pos = 0;
+    while (pos < data.size())
+    {
+        size_t eol = data.find('\n', pos);
+        if (eol == std::string::npos) eol = data.size();
+        std::string ln = data.substr(pos, eol - pos);
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ')) ln.pop_back();
+        size_t b1 = ln.find('|');
+        if (b1 != std::string::npos && b1 == key.size() &&
+            _strnicmp(ln.c_str(), key.c_str(), b1) == 0)
+        {
+            size_t b2 = ln.find('|', b1 + 1);
+            if (b2 != std::string::npos)
+            {
+                if (sizeOut) *sizeOut = _strtoui64(ln.c_str() + b1 + 1, nullptr, 10);
+                if (ownerOut) *ownerOut = ln.substr(b2 + 1);
+                return true;
+            }
+        }
+        pos = eol + 1;
+    }
+    return false;
+}
+
 // v0.27: pak 모드 켜기/끄기 -- plugins\<rel>\*.pak 을 Content\Paks\<타깃>\ 에
 // 하드링크로 걸었다 뗀다. 반환 = 처리한 파일 수.
-static int linkPakFiles(const wchar_t* rel, const wchar_t* targetSub, bool on)
+// v0.50(TODO 13): owner = 장부에 적을 소유모드 폴더명. 걸면 기록, 지우면 말소.
+static int linkPakFiles(const wchar_t* rel, const wchar_t* targetSub, bool on,
+                        const wchar_t* owner)
 {
     wchar_t src[MAX_PATH * 2];
     pluginSrcPath(src, rel);
@@ -2315,25 +3074,90 @@ static int linkPakFiles(const wchar_t* rel, const wchar_t* targetSub, bool on)
         {
             if (pathExistsW(d))
             {
-                if (sameFileIdentity(s, d)) { ++done; continue; }  // 이미 걸려 있다
+                if (sameFileIdentity(s, d))
+                {   // 이미 걸려 있다 -- 장부에 없으면 입양 (구판에서 건 링크의 이행)
+                    ++done;
+                    if (!pakManifestFind(targetSub, fd.cFileName, nullptr, nullptr))
+                        pakManifestPut(targetSub, fd.cFileName, fileSizeOfW(d), owner);
+                    continue;
+                }
+                // v0.50(TODO 13): 실체가 다르다 = 모드 업데이트로 원본이 바뀐 경우가
+                // 대부분 -- 장부에 있고 + 크기 일치 + **소유자가 이 모드**일 때만
+                // 우리 잔재로 보고 걷어낸 뒤 새 원본으로 다시 건다.
+                // 리뷰 D1: 소유자 검증 없이는 같은 파일명을 쓰는 **다른 모드의 산
+                // 링크**를 지워버린다 (넥서스 pak 이름 충돌은 실재).
+                ULONGLONG msz = 0;
+                std::string mOwn;
+                if (pakManifestFind(targetSub, fd.cFileName, &msz, &mOwn) &&
+                    msz != 0 && msz == fileSizeOfW(d) &&
+                    _stricmp(mOwn.c_str(), u8(owner).c_str()) == 0)
+                {
+                    if (DeleteFileW(d))
+                    {
+                        logf("pak: '%s' 구판 잔재 교체 (장부 검증)", u8(fd.cFileName).c_str());
+                        if (CreateHardLinkW(d, s, nullptr))
+                        {
+                            ++done;
+                            pakManifestPut(targetSub, fd.cFileName, fileSizeOfW(s), owner);
+                        }
+                        else
+                        {
+                            pakManifestPut(targetSub, fd.cFileName, 0, nullptr);
+                            logf("FAIL pak: 재링크 실패 %s (err=%lu)", u8(fd.cFileName).c_str(), GetLastError());
+                        }
+                    }
+                    else
+                        logf("FAIL pak: 구판 잔재 삭제 실패 %s (err=%lu) -- 다음 부팅 초입에 재시도",
+                             u8(fd.cFileName).c_str(), GetLastError());
+                    continue;
+                }
                 logf("WARN pak: '%s' 가 이미 있는데 다른 파일이다 -- 건드리지 않는다",
                      u8(fd.cFileName).c_str());
                 continue;
             }
-            if (CreateHardLinkW(d, s, nullptr)) ++done;
+            if (CreateHardLinkW(d, s, nullptr))
+            {
+                ++done;
+                pakManifestPut(targetSub, fd.cFileName, fileSizeOfW(s), owner);  // v0.50: 장부 기록
+            }
             else logf("FAIL pak: 하드링크 실패 %s (err=%lu)", u8(fd.cFileName).c_str(), GetLastError());
         }
         else
         {
-            if (!pathExistsW(d)) continue;
-            // ⚠ 우리 파일과 같은 실체일 때만 지운다 (사용자가 손수 넣은 것 보호)
-            if (!sameFileIdentity(s, d))
+            if (!pathExistsW(d))
+            {
+                pakManifestPut(targetSub, fd.cFileName, 0, nullptr);  // 이미 없음 -- 장부만 정리
+                continue;
+            }
+            // ⚠ 우리 파일과 같은 실체일 때만 지운다 (사용자가 손수 넣은 것 보호).
+            // v0.50(TODO 13): 실체가 달라도 "장부에 있고 + 크기 일치 + 소유자가
+            // 이 모드"면 우리 잔재(업데이트로 원본이 바뀐 경우)로 보고 지운다.
+            // 리뷰 D1: 소유자 검증 필수 -- 이름 충돌한 다른 모드의 산 링크 보호.
+            bool ours = sameFileIdentity(s, d);
+            if (!ours)
+            {
+                ULONGLONG msz = 0;
+                std::string mOwn;
+                ours = pakManifestFind(targetSub, fd.cFileName, &msz, &mOwn) &&
+                       msz != 0 && msz == fileSizeOfW(d) &&
+                       _stricmp(mOwn.c_str(), u8(owner).c_str()) == 0;
+            }
+            if (!ours)
             {
                 logf("WARN pak: '%s' 는 우리가 건 링크가 아니다 -- 그대로 둔다",
                      u8(fd.cFileName).c_str());
                 continue;
             }
-            if (DeleteFileW(d)) ++done;
+            if (DeleteFileW(d))
+            {
+                ++done;
+                pakManifestPut(targetSub, fd.cFileName, 0, nullptr);  // v0.50: 장부 말소
+            }
+            else logf("FAIL pak unlink: %s (err=%lu) -- 엔진이 이미 연 파일은 지워지지 않는다. "
+                      "다음 부팅 초입(earlyGuard)에 재시도된다",
+                      u8(fd.cFileName).c_str(), GetLastError());
+            // ⚠ 실측 2026-08-13: 안전모드가 '껐다'던 pak 이 공유 위반으로 안 지워져
+            // ~mods 에 남아 매 부팅 마운트되고 있었다 (조용한 실패 금지).
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -2356,9 +3180,13 @@ static void applyPluginState(PlgRow& r)
         // BPModLoaderMod 가 '블루프린트 모드'로 로드하려 들어 에셋 팩이 크래시했다
         // (실측: _P 캐릭터 팩을 LogicMods 에 넣고 재시작 -> 크래시). 명시적으로
         // pak_target=logicmods 라고 적은 BP 모드만 그쪽으로 보낸다.
-        const wchar_t* sub = (r.pakTarget[0] && _stricmp(r.pakTarget, "logicmods") == 0)
-                                 ? L"LogicMods" : L"~mods";
-        int nf = linkPakFiles(r.rel[0] ? r.rel : r.name, sub, r.on);
+        bool toLogic = r.pakTarget[0] && _stricmp(r.pakTarget, "logicmods") == 0;
+        const wchar_t* sub = toLogic ? L"LogicMods" : L"~mods";
+        // 리뷰(v0.50): pak_target 을 바꾼 모드의 **반대쪽** 잔류 링크를 항상 걷는다.
+        // 안 걷으면 이중 마운트가 영구화되고, LogicMods 방향 잔류는 BPModLoaderMod
+        // 가 에셋 pak 을 BP 모드로 로드하는 실측 크래시를 재현한다. 없으면 no-op.
+        linkPakFiles(r.rel[0] ? r.rel : r.name, toLogic ? L"~mods" : L"LogicMods", false, r.name);
+        int nf = linkPakFiles(r.rel[0] ? r.rel : r.name, sub, r.on, r.name);
         wchar_t pen[MAX_PATH * 2];
         pluginSrcPath(pen, r.rel[0] ? r.rel : r.name);
         lstrcatW(pen, L"\\enabled.txt");
@@ -2426,6 +3254,51 @@ static void applyPluginState(PlgRow& r)
     writeRuntimeFlag(r.name, r.rel, r.on);
 }
 
+/* v0.50: 진입점 정합 — "켜짐인데 재시작해도 안 뜨는" 문제의 진짜 뿌리 (넥서스 리포트 1번)
+
+   UE4SS 는 `Mods\` 를 훑어 모드를 찾는다. 우리 방식에서 `Mods\<이름>` 은 plugins 쪽을
+   가리키는 **정션**이고, 그 정션을 만드는 코드는 지금까지 **토글 한 곳뿐**이었다.
+   그런데 서드파티 배포 zip 은 enabled.txt 를 담은 채 오는 경우가 많다 — 그런 모드를
+   plugins 에 넣으면 패널은 켜짐으로 보이지만(plugins 쪽 enabled.txt 가 있으니)
+   **진입점이 없어 UE4SS 는 그 모드의 존재조차 모른다.** 그대로 재시작해도 안 뜨고,
+   패널에서 껐다 켜야(=정션 생성) 비로소 다음 재시작에 로드됐다. 리포터가 겪은 그것.
+
+   여기서 켜짐인데 진입점이 없는 모드에 정션을 만들어 둔다 -> **이제는 그냥 재시작하면
+   된다.** (이번 실행에는 못 싣는다 — UE4SS 는 부팅 때 이미 목록을 다 만들었다.
+   그래서 '재시작 필요' 배지가 함께 필요하다.)
+   ⚠ 반드시 bootGuard(안전모드) **뒤에** 부를 것 — 방금 끈 모드를 되살리면 안 된다. */
+static void reconcileEntryPoints(const char* why)
+{
+    static PlgEnt ents[MM_MAX_PLUGINS];   // 게임/업데이트 스레드 전용 (스택 절약)
+    int n = collectPlugins(ents, MM_MAX_PLUGINS);
+    int made = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (ents[i].pak) continue;   // pak 은 진입점이 없다 (Content\Paks 하드링크)
+        const wchar_t* rel = ents[i].rel[0] ? ents[i].rel : ents[i].name;
+        wchar_t pen[MAX_PATH * 2];
+        pluginSrcPath(pen, rel);
+        lstrcatW(pen, L"\\enabled.txt");
+        if (!pathExistsW(pen) && !modsTxtEnabled(ents[i].name)) continue;   // 꺼진 모드
+        wchar_t dst[MAX_PATH * 2];
+        gameModsRoot(dst);
+        lstrcatW(dst, ents[i].name);
+        if (pathExistsW(dst)) continue;   // 진입점 이미 있음 (정션이든 옛 사본이든)
+        wchar_t src[MAX_PATH * 2];
+        pluginSrcPath(src, rel);
+        if (createJunction(dst, src))
+        {
+            ++made;
+            logf("진입점 정합(%s): '%s' 켜짐인데 진입점이 없어 정션 생성 -- 다음 재시작에 로드",
+                 why, u8(ents[i].name).c_str());
+        }
+        else
+            logf("WARN 진입점 정합(%s): '%s' 정션 생성 실패 (err=%lu)", why,
+                 u8(ents[i].name).c_str(), GetLastError());
+    }
+    if (made) logf("진입점 정합(%s): %d개 복구", why, made);
+}
+
 /* ======================= v0.23: 부팅 안전장치 (안전 모드) ==================
 
   왜 필요한가 (2026-08-06 실측 사고): 게임이 패치되자 하드코딩 주소를 쓰던 모드가
@@ -2445,7 +3318,14 @@ static void applyPluginState(PlgRow& r)
 */
 static ULONGLONG g_bootPrevLaunch = 0;
 static std::atomic<bool> g_safeModePending{false};
-static wchar_t g_safeModeText[480];   // v0.40: EN 문구 + 최장 표시명(63자)이 300을 넘는다
+static wchar_t g_safeModeText[768];   // v0.50: 끈 모드 목록 + 블랙박스 판정까지 (480 -> 768)
+// v0.50: 팝업에 '실제로 끈 모드 목록'을 보여준다 -- 실측 2026-08-13: pak 모드가
+// 크래시 원인이었는데 팝업은 '마지막 로거'(DsAutoFood)를 지목했다. pak 모드는
+// 로그를 안 쓰므로 그 휴리스틱에 절대 못 걸린다 -- 목록이 정답, 로거는 참고.
+static wchar_t g_safeModeList[320];
+static bool g_safeModeHadPak = false;
+static int g_safeModeListN = 0;
+static wchar_t g_safeModePakList[200];  // v0.50: 블랙박스 '로딩 중 사망' 판정 때 지목할 pak 들
 
 static ULONGLONG ftToU64(const FILETIME& ft)
 {
@@ -2555,6 +3435,10 @@ static int forceAllPluginsOff(const wchar_t* reason)
     int n = collectPlugins(ents, MM_MAX_PLUGINS);
     std::string list;
     int off = 0;
+    g_safeModeList[0] = 0;      // v0.50: 팝업용 표시 목록 리셋
+    g_safeModeHadPak = false;
+    g_safeModeListN = 0;
+    g_safeModePakList[0] = 0;
     for (int i = 0; i < n; ++i)
     {
         wchar_t en[MAX_PATH * 2];
@@ -2564,14 +3448,16 @@ static int forceAllPluginsOff(const wchar_t* reason)
         wchar_t pen[MAX_PATH * 2];   // v0.27: 정본은 plugins 쪽 (pak 모드는 여기만 있다)
         pluginSrcPath(pen, ents[i].rel[0] ? ents[i].rel : ents[i].name);
         lstrcatW(pen, L"\\enabled.txt");
-        bool was = pathExistsW(en) || pathExistsW(pen);
+        // v0.50(리뷰 D1): mods.txt "<이름> : 1" 로만 켜진 모드도 '켜져 있었다'로 센다
+        // -- 패널 r.on 과 동일한 3중 판정. 빠뜨리면 조용히 꺼놓고 목록/팝업에서 누락.
+        bool was = pathExistsW(en) || pathExistsW(pen) || modsTxtEnabled(ents[i].name);
         if (was) { DeleteFileW(en); DeleteFileW(pen); }
         modsTxtDisable(ents[i].name);
         removeModEntry(ents[i].name);  // v0.26: 정션 진입점까지 걷어낸다
         if (ents[i].pak)               // v0.27: pak 링크도 뗀다 (양쪽 타깃 모두)
         {
-            linkPakFiles(ents[i].rel[0] ? ents[i].rel : ents[i].name, L"LogicMods", false);
-            linkPakFiles(ents[i].rel[0] ? ents[i].rel : ents[i].name, L"~mods", false);
+            linkPakFiles(ents[i].rel[0] ? ents[i].rel : ents[i].name, L"LogicMods", false, ents[i].name);
+            linkPakFiles(ents[i].rel[0] ? ents[i].rel : ents[i].name, L"~mods", false, ents[i].name);
         }
         writeRuntimeFlag(ents[i].name, ents[i].rel, false);  // 이번 실행 최선 (협조 모드는 즉시 멎는다)
         if (const char* k = rtKeyOf(ents[i].name)) rtSetKey(k, false);
@@ -2579,7 +3465,44 @@ static int forceAllPluginsOff(const wchar_t* reason)
         {
             ++off;
             list += u8(ents[i].name) + "\n";
+            // v0.50: 팝업용 표시 목록 -- 표시명(dsplugin.ini name=) + pak 표기
+            if (ents[i].pak) g_safeModeHadPak = true;
+            wchar_t disp[64];
+            disp[0] = 0;
+            {
+                wchar_t mp[MAX_PATH * 2];
+                pluginSrcPath(mp, ents[i].rel[0] ? ents[i].rel : ents[i].name);
+                lstrcatW(mp, L"\\dsplugin.ini");
+                std::string ini = readFileA(mp);
+                if (!ini.empty())
+                {
+                    if (ini.size() >= 3 && ini.compare(0, 3, "\xEF\xBB\xBF") == 0) ini.erase(0, 3);
+                    std::string nm = iniValueLang(ini, "plugin", "name");
+                    if (!nm.empty()) utf8ToW(nm, disp, 64);
+                }
+            }
+            if (!disp[0]) lstrcpynW(disp, ents[i].name, 64);
+            if (ents[i].pak)
+            {   // v0.50: 블랙박스가 '로딩 중 사망'을 판정하면 이 목록으로 pak 을 지목
+                size_t pu = wcslen(g_safeModePakList);
+                if (pu < 130)
+                    swprintf(g_safeModePakList + pu, 200 - pu, L"%s『%s』",
+                             pu ? L", " : L"", disp);
+            }
+            size_t used = wcslen(g_safeModeList);
+            if (used < 220)
+            {
+                swprintf(g_safeModeList + used, 320 - used, L"%s『%s』%s",
+                         used ? L"\n" : L"", disp, ents[i].pak ? L" [pak]" : L"");
+                ++g_safeModeListN;
+            }
         }
+    }
+    if (off > g_safeModeListN && g_safeModeListN > 0)
+    {   // 목록 칸이 모자라 잘렸다 -- 나머지는 개수로
+        size_t used = wcslen(g_safeModeList);
+        swprintf(g_safeModeList + used, 320 - used,
+                 TR(L"\n외 %d개", L"\nand %d more"), off - g_safeModeListN);
     }
     if (off)
     {
@@ -2599,6 +3522,355 @@ static int forceAllPluginsOff(const wchar_t* reason)
     }
     logf("안전모드(%s): 플러그인 %d개 강제 끔 (검사 %d개)", u8(reason).c_str(), off, n);
     return off;
+}
+
+/* ======================= v0.50: 부트 블랙박스 =========================
+   세션 진행 단계를 파일에 즉시 기록해, 크래시 후 "어디서 죽었나"를 판정한다
+   (사용자 제안 2026-08-13). 기록 파일 = Mods\DsCppModManager\blackbox.txt,
+   부팅 때 _prev 로 회전. 단계: ctor -> engine-init -> title <-> title-lost.
+   + modstart 줄(UE4SS 로그에서 "Starting ... mod" 수집 = 정밀 브래킷)
+   + lastlog.txt (UE4SS 로그 꼬리 4KB, 5초 주기 = 사망 직전 기록. 최대 5초 공백)
+   분석(bootGuard)의 용의자 우선순위 (사용자 규칙):
+   ① 모드 시작 단계 사망 -> 마지막 modstart 를 이름으로 지목
+   ② 게임 로딩 진입 중 사망 -> (이름을 못 대므로) 이때만 pak 을 지목
+   ③ 그 외 -> 기존 '마지막 기록 모드' 참고 표시 */
+static char g_bbLastPhase[24] = {0};
+
+static void blackboxPath(wchar_t* out, bool prev)
+{
+    modRootPath(out);
+    lstrcatW(out, prev ? L"blackbox_prev.txt" : L"blackbox.txt");
+}
+
+static void blackboxAppend(const char* text)
+{
+    wchar_t p[MAX_PATH * 2];
+    blackboxPath(p, false);
+    // 리뷰 F6: 게임 스레드(phase)와 UpdateThread(modstart)가 겹칠 수 있다 --
+    // FILE_SHARE_WRITE 로 열어야 한쪽이 공유 위반으로 조용히 유실되지 않는다
+    // (FILE_APPEND_DATA 쓰기는 원자적 append 라 줄이 통째로 섞일 뿐 깨지지 않는다).
+    HANDLE h = CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char line[320];
+    int n = snprintf(line, sizeof(line), "%02u:%02u:%02u.%03u %s\r\n",
+                     st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, text);
+    // 리뷰 F4: snprintf 는 잘렸을 때 '원래 길이'를 반환한다 -- 그대로 WriteFile 에
+    // 넘기면 스택 밖을 읽는다(OOB). 버퍼 한도로 클램프.
+    if (n > (int)sizeof(line) - 1) n = (int)sizeof(line) - 1;
+    DWORD wr = 0;
+    if (n > 0) WriteFile(h, line, (DWORD)n, &wr, nullptr);
+    CloseHandle(h);
+}
+
+// 같은 단계 연속 기록은 생략 (게임/UE4SS 스레드 양쪽에서 불려도 무해 -- 최악은 중복 한 줄)
+static void blackboxPhase(const char* ph)
+{
+    if (strcmp(g_bbLastPhase, ph) == 0) return;
+    strncpy_s(g_bbLastPhase, ph, _TRUNCATE);
+    char line[64];
+    snprintf(line, sizeof(line), "phase %s", ph);
+    blackboxAppend(line);
+}
+
+// 생성자 1회: 직전 세션 기록을 _prev 로 보존하고 새로 시작. lastlog 도 함께 보존
+// (새 세션의 첫 스냅샷이 죽은 세션의 마지막 기록을 덮으면 안 된다).
+static void blackboxRotate()
+{
+    wchar_t cur[MAX_PATH * 2], prv[MAX_PATH * 2];
+    blackboxPath(cur, false);
+    blackboxPath(prv, true);
+    MoveFileExW(cur, prv, MOVEFILE_REPLACE_EXISTING);
+    modRootPath(cur);
+    lstrcatW(cur, L"lastlog.txt");
+    modRootPath(prv);
+    lstrcatW(prv, L"lastlog_prev.txt");
+    MoveFileExW(cur, prv, MOVEFILE_REPLACE_EXISTING);
+    char boot[80];
+    snprintf(boot, sizeof(boot), "boot %s", u8(MOD_VER_W).c_str());
+    blackboxAppend(boot);
+    blackboxPhase("ctor");
+}
+
+// UE4SS 루트 (= Mods\ 의 부모) -- UE4SS.log 가 있는 곳
+static void ue4ssRootPath(wchar_t* out)
+{
+    gameModsRoot(out);              // "...\ue4ss\Mods\"
+    size_t len = wcslen(out);
+    if (len > 5) out[len - 5] = 0;  // "Mods\" 걷어내기
+}
+
+// on_update 5초 주기 (UpdateThread, 파일 I/O 전용):
+// 1) 타이틀 확인 전 -- UE4SS 로그에서 "Starting <종류> mod '<이름>'" 줄을 수집해
+//    새 것만 blackbox 에 modstart 로 기록 (정밀 브래킷: 어느 모드까지 시작됐나)
+// 2) 항상 -- 로그 꼬리 4KB 를 lastlog.txt 로 스냅샷 (사망 직전 기록, 5초 공백 한계)
+static void blackboxTick(ULONGLONG now)
+{
+    static ULONGLONG s_last = 0;
+    if (s_last && now - s_last < 5000) return;
+    s_last = now;
+    static ULONGLONG s_first = 0;
+    if (!s_first) s_first = now;
+    wchar_t lp[MAX_PATH * 2];
+    ue4ssRootPath(lp);
+    lstrcatW(lp, L"UE4SS.log");
+    static bool s_bracketDone = false;
+    static int s_seen = 0;
+    if (!s_bracketDone && (strcmp(g_bbLastPhase, "title") == 0 || now - s_first > 90000))
+        s_bracketDone = true;   // 타이틀 도달 = 모드 시작 전부 완료 (또는 90초 상한)
+    if (!s_bracketDone)
+    {
+        // 줄 단위로 두 형식을 다 잡는다 (라이브 실측 20:58 -- 매니저 관리 모드는
+        // 전부 enabled.txt 계층이라 "Mod 'X' has enabled.txt, starting mod." 형식):
+        //   ① "Starting <종류> mod '<이름>'"          (mods.txt 계층 = UE4SS 내장들)
+        //   ② "Mod '<이름>' has enabled.txt, starting mod."  (유저 모드 전부)
+        // 줄 순서 = 시간 순서 -- '마지막으로 시작된 모드' 판정의 근거.
+        std::string log = readFileA(lp);   // 부팅 초의 로그는 작다
+        size_t pos = 0;
+        int idx = 0;
+        while (pos < log.size())
+        {
+            size_t eol = log.find('\n', pos);
+            if (eol == std::string::npos) eol = log.size();
+            std::string ln = log.substr(pos, eol - pos);
+            std::string entry;
+            size_t a = ln.find("Starting ");
+            if (a != std::string::npos)
+            {
+                size_t k = ln.find(" mod '", a);
+                // 리뷰 F3: 종류 토막은 "Lua"/"C++" 뿐 -- 길이 1~16 밖이면 위조 줄
+                if (k != std::string::npos && k > a + 9 && k - (a + 9) <= 16)
+                {
+                    size_t ns = k + 6;
+                    size_t ne = ln.find('\'', ns);
+                    if (ne != std::string::npos && ne - ns < 100)
+                        entry = "modstart " + ln.substr(a + 9, k - (a + 9)) +
+                                " " + ln.substr(ns, ne - ns);
+                }
+            }
+            if (entry.empty())
+            {
+                size_t m = ln.find("Mod '");
+                if (m != std::string::npos)
+                {
+                    size_t ns = m + 5;
+                    size_t ne = ln.find('\'', ns);
+                    if (ne != std::string::npos && ne - ns < 100 &&
+                        ln.compare(ne, 31, "' has enabled.txt, starting mod") == 0)
+                        entry = "modstart enabled " + ln.substr(ns, ne - ns);
+                }
+            }
+            if (!entry.empty())
+            {
+                ++idx;
+                if (idx > s_seen)
+                {
+                    s_seen = idx;
+                    blackboxAppend(entry.c_str());
+                }
+            }
+            pos = eol + 1;
+        }
+    }
+    HANDLE h = CreateFileW(lp, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER sz;
+    if (GetFileSizeEx(h, &sz) && sz.QuadPart > 0)
+    {
+        const DWORD WANT = 4096;
+        DWORD take = (sz.QuadPart < (LONGLONG)WANT) ? (DWORD)sz.QuadPart : WANT;
+        LARGE_INTEGER ps;
+        ps.QuadPart = sz.QuadPart - take;
+        SetFilePointerEx(h, ps, nullptr, FILE_BEGIN);
+        std::string buf;
+        buf.resize(take);
+        DWORD got = 0;
+        if (take && ReadFile(h, &buf[0], take, &got, nullptr) && got)
+        {
+            wchar_t sp[MAX_PATH * 2];
+            modRootPath(sp);
+            lstrcatW(sp, L"lastlog.txt");
+            HANDLE o = CreateFileW(sp, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (o != INVALID_HANDLE_VALUE)
+            {
+                DWORD wr = 0;
+                WriteFile(o, buf.data(), got, &wr, nullptr);
+                CloseHandle(o);
+            }
+        }
+    }
+    CloseHandle(h);
+}
+
+/* v0.50: 초입 안전장치 (생성자 시점, 순수 파일 I/O 전용)
+   UE4SS 는 C++ 모드를 엔진 PreInit 보다 먼저 로드한다 (실측 2026-08-13: 콘솔 생성
+   +10ms 에 'Starting C++ mod', 엔진 pak 마운트는 그보다 한참 뒤). 이 틈에:
+   1) 직전 크래시/게임 패치 감지 시 -- 켜진 pak 의 링크를 **엔진이 열기 전에** 뗀다.
+      첫 틱(bootGuard) 시점엔 엔진이 pak 을 이미 열고 있어 DeleteFileW 가 공유 위반으로
+      실패한다 (실측: '껐다'던 pak 이 ~mods 에 남아 매 부팅 마운트 -- 크래시 반복의 원인).
+      끄기 본조치(enabled.txt·팝업·bootstate 갱신)는 종전대로 bootGuard 가 한다.
+   2) 항상 -- 꺼진 pak 모드의 잔류 링크 청소 (1의 과거 실패분 자가 치유).
+   ⚠ 이 함수에서 UE API 호출 절대 금지 (엔진 미초기화 상태). bootstate 를 다시 쓰지
+   않는다 (bootGuard 의 감지 조건을 소모하면 안 된다). */
+static void earlyBootGuard()
+{
+    wchar_t p[MAX_PATH * 2];
+    bootStatePath(p);
+    std::string prev = readFileA(p);
+    ULONGLONG prevLaunch = bootStateGet(prev, "launch");
+    ULONGLONG prevSize = bootStateGet(prev, "exe_size");
+    ULONGLONG prevMtime = bootStateGet(prev, "exe_mtime");
+    ULONGLONG size = 0, mtime = 0;
+    bool haveExe = gameExeInfo(&size, &mtime);
+    bool updated = haveExe && prevSize && (size != prevSize || mtime != prevMtime);
+    wchar_t crashName[128] = {0};
+    bool crashed = prevLaunch != 0 && crashArtifactNewerThan(prevLaunch, crashName, 128);
+
+    static PlgEnt ents[MM_MAX_PLUGINS];
+    int n = collectPlugins(ents, MM_MAX_PLUGINS);
+    int cut = 0, swept = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        if (!ents[i].pak) continue;
+        const wchar_t* rel = ents[i].rel[0] ? ents[i].rel : ents[i].name;
+        wchar_t pen[MAX_PATH * 2];
+        pluginSrcPath(pen, rel);
+        lstrcatW(pen, L"\\enabled.txt");
+        wchar_t en[MAX_PATH * 2];
+        gameModsRoot(en);
+        lstrcatW(en, ents[i].name);
+        lstrcatW(en, L"\\enabled.txt");
+        bool on = pathExistsW(pen) || pathExistsW(en) || modsTxtEnabled(ents[i].name);
+        if (on && (updated || crashed))
+        {   // 위험 감지 -- 링크만 선제 해제 (identity 검증은 linkPakFiles 내부에서)
+            int k = linkPakFiles(rel, L"LogicMods", false, ents[i].name) +
+                    linkPakFiles(rel, L"~mods", false, ents[i].name);
+            if (k)
+            {
+                cut += k;
+                logf("earlyGuard: pak '%s' 링크 %d개 선제 해제 (%s)", u8(ents[i].name).c_str(),
+                     k, updated ? "게임 패치" : "직전 크래시");
+            }
+        }
+        else if (!on)
+        {   // 잔류 링크 청소 -- 과거 첫 틱 삭제 실패(공유 위반)의 자가 치유
+            int k = linkPakFiles(rel, L"LogicMods", false, ents[i].name) +
+                    linkPakFiles(rel, L"~mods", false, ents[i].name);
+            if (k)
+            {
+                swept += k;
+                logf("earlyGuard: 꺼진 pak '%s' 의 잔류 링크 %d개 청소", u8(ents[i].name).c_str(), k);
+            }
+        }
+    }
+    // v0.50(TODO 13): 장부 스윕 -- 원본 순회로는 못 잡는 잔재(업데이트로 파일명/실체가
+    // 바뀐 옛 링크)를 장부 기준으로 걷는다. 엔진이 pak 을 열기 전이라 삭제가 성립한다.
+    {
+        wchar_t mp[MAX_PATH * 2];
+        pakManifestPath(mp);
+        std::string mdata = readFileA(mp);
+        int stale = 0;
+        size_t pos = 0;
+        while (pos < mdata.size())
+        {
+            size_t eol = mdata.find('\n', pos);
+            if (eol == std::string::npos) eol = mdata.size();
+            std::string ln = mdata.substr(pos, eol - pos);
+            pos = eol + 1;
+            while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ')) ln.pop_back();
+            if (ln.empty()) continue;
+            size_t b1 = ln.find('|');
+            size_t b2 = (b1 == std::string::npos) ? std::string::npos : ln.find('|', b1 + 1);
+            if (b2 == std::string::npos) continue;
+            std::string key = ln.substr(0, b1);           // "<sub>\<파일>"
+            ULONGLONG msz = _strtoui64(ln.c_str() + b1 + 1, nullptr, 10);
+            std::string ownerU = ln.substr(b2 + 1);
+            size_t sl = key.find('\\');
+            if (sl == std::string::npos) continue;
+            std::string subU = key.substr(0, sl);
+            std::string fileU = key.substr(sl + 1);
+            // 손편집 대비 가드: sub 화이트리스트 + 파일명에 경로 문자 금지
+            if (subU != "~mods" && subU != "LogicMods") continue;
+            if (fileU.empty() || fileU.find('\\') != std::string::npos ||
+                fileU.find('/') != std::string::npos || fileU.find("..") != std::string::npos)
+                continue;
+            wchar_t subW[16], fileW[MAX_PATH], ownerW[64];
+            utf8ToW(subU, subW, 16);
+            utf8ToW(fileU, fileW, MAX_PATH);
+            utf8ToW(ownerU, ownerW, 64);
+            wchar_t tgt[MAX_PATH * 2];
+            contentPaksPath(tgt, subW);
+            lstrcatW(tgt, fileW);
+            if (!pathExistsW(tgt))
+            {   // 파일이 이미 없다 -- 장부만 정리
+                pakManifestPut(subW, fileW, 0, nullptr);
+                continue;
+            }
+            // 소유 모드의 현재 상태·원본과 대조
+            bool ownerFound = false, ownerOn = false, live = false, srcHas = false;
+            wchar_t src2[MAX_PATH * 2] = {0};
+            for (int i = 0; i < n; ++i)
+            {
+                if (_wcsicmp(ents[i].name, ownerW) != 0) continue;
+                ownerFound = true;
+                const wchar_t* rel2 = ents[i].rel[0] ? ents[i].rel : ents[i].name;
+                wchar_t pen2[MAX_PATH * 2];
+                pluginSrcPath(pen2, rel2);
+                lstrcatW(pen2, L"\\enabled.txt");
+                wchar_t en2[MAX_PATH * 2];
+                gameModsRoot(en2);
+                lstrcatW(en2, ents[i].name);
+                lstrcatW(en2, L"\\enabled.txt");
+                ownerOn = pathExistsW(pen2) || pathExistsW(en2) || modsTxtEnabled(ents[i].name);
+                pluginSrcPath(src2, rel2);
+                lstrcatW(src2, L"\\");
+                lstrcatW(src2, fileW);
+                srcHas = pathExistsW(src2);
+                live = srcHas && sameFileIdentity(src2, tgt);  // 현역 링크인가
+                break;
+            }
+            // 리뷰 D3: '스캔에 없음'과 '모드가 진짜 없음'을 구분한다 -- 스캔이
+            // 상한(50)에 걸렸거나, 폴더가 실제로 남아 있으면 판정 불가 = 건드리지 않는다.
+            if (!ownerFound)
+            {
+                if (n >= MM_MAX_PLUGINS) continue;
+                wchar_t ownDir[MAX_PATH * 2];
+                pluginSrcPath(ownDir, ownerW);
+                if (pathExistsW(ownDir)) continue;
+                // 폴더도 없다 = 모드 삭제됨 -- 아래 크기 검증 후 청소
+            }
+            if (ownerOn && live) continue;   // 켜져 있고 현역 -- 정상
+            // 꺼졌거나, 켜져 있어도 원본과 실체가 다르면(업데이트 잔재) 걷는다.
+            // 검증: 크기가 장부와 일치할 때만 (사용자 파일 보호 잔여 규칙).
+            if (msz != 0 && msz == fileSizeOfW(tgt) && DeleteFileW(tgt))
+            {
+                pakManifestPut(subW, fileW, 0, nullptr);
+                // 리뷰 D4: 켜진 모드의 같은 이름 새 원본이 있으면 그 자리에서 재링크
+                // -- 안 하면 켜진 모드가 pak 없이 부팅한다 (토글 전까지 안 걸림).
+                if (ownerOn && srcHas && CreateHardLinkW(tgt, src2, nullptr))
+                {
+                    pakManifestPut(subW, fileW, fileSizeOfW(src2), ownerW);
+                    logf("earlyGuard: 켜진 pak 구판 잔재 교체(재링크) %s\\%s (소유: %s)",
+                         subU.c_str(), fileU.c_str(), ownerU.c_str());
+                }
+                else
+                {
+                    ++stale;
+                    logf("earlyGuard: 장부 잔재 청소 %s\\%s (소유: %s)", subU.c_str(),
+                         fileU.c_str(), ownerU.c_str());
+                }
+            }
+        }
+        swept += stale;
+    }
+    if (cut || swept || crashed || updated)
+        logf("earlyGuard: 선제해제 %d 잔류청소 %d (크래시=%d 패치=%d)", cut, swept,
+             (int)crashed, (int)updated);
 }
 
 /* v0.24: '다잉 메시지' -- 크래시 직전에 **마지막으로 기록을 남긴 모드**를 찾는다.
@@ -2796,44 +4068,148 @@ static void bootGuard()
         logf("bootGuard: 켜져 있던 플러그인이 없어 조치 없음");
         return;
     }
+    // v0.50: 팝업의 주인공은 **실제로 끈 모드 목록**이다 (safemode_last 와 같은 내용).
+    // '마지막 로거'는 참고 정보로 강등 -- pak 모드는 로그가 없어 그 휴리스틱에 절대
+    // 못 걸리는데, 실측(2026-08-13)에서 pak 이 범인인 크래시에 DsAutoFood 가
+    // 지목되는 오해를 낳았다.
+    const wchar_t* pakNote = g_safeModeHadPak
+        ? TR(L"\n\n※ 게임 업데이트 직후에는 pak(외형·콘텐츠) 모드가 크래시 원인인 경우가 많습니다.",
+             L"\n\n* Right after a game update, pak (appearance/content) mods are a common crash cause.")
+        : L"";
     if (updated)
     {
-        swprintf(g_safeModeText, 480,
-                 TR(L"게임이 업데이트되어 안전을 위해 모드 %d개를 껐습니다.\n"
+        swprintf(g_safeModeText, 768,
+                 TR(L"게임이 업데이트되어 안전을 위해 다음 모드 %d개를 껐습니다:\n%s%s\n\n"
                     L"모드가 새 버전에 맞는지 확인한 뒤 매니저에서 다시 켜 주세요.",
-                    L"The game was updated, so %d mod(s) were switched off for safety.\n"
-                    L"Check that your mods match the new version, then re-enable them here."), off);
+                    L"The game was updated, so these %d mod(s) were switched off for safety:\n%s%s\n\n"
+                    L"Check that your mods match the new version, then re-enable them here."),
+                 off, g_safeModeList, pakNote);
     }
     else
     {
-        // v0.24: 크래시 직전 마지막으로 기록을 남긴 모드를 함께 알려 준다(정황).
+        // v0.50: 블랙박스 판독 -- 용의자 우선순위 (사용자 규칙 2026-08-13):
+        // ① 모드 시작 단계 사망 = 마지막 modstart 이름 지목
+        // ② 게임 로딩 진입 중(title-lost) 사망 = 이름을 못 대므로 이때만 pak 지목
+        // ③ 그 외 = 기존 '마지막 기록 모드' 참고
+        wchar_t verdict[400] = {0};   // 리뷰 F5: EN pak 목록 최악 ~311 -- 280 은 잘렸다
+        bool vNamed = false;          // 용의자를 이름으로 댔는가 (댔으면 아래 '참고' 생략)
+        {
+            wchar_t bp[MAX_PATH * 2];
+            blackboxPath(bp, true);   // 생성자에서 _prev 로 회전해 둔 죽은 세션 기록
+            std::string bb = readFileA(bp);
+            if (!bb.empty())
+            {
+                std::string lastPhase, lastStart;
+                size_t bpos = 0;
+                while (bpos < bb.size())
+                {
+                    size_t eol = bb.find('\n', bpos);
+                    if (eol == std::string::npos) eol = bb.size();
+                    std::string ln = bb.substr(bpos, eol - bpos);
+                    while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ')) ln.pop_back();
+                    size_t sp1 = ln.find(' ');   // "HH:MM:SS.mmm " 접두 제거
+                    std::string body = (sp1 == std::string::npos) ? ln : ln.substr(sp1 + 1);
+                    if (body.compare(0, 6, "phase ") == 0) lastPhase = body.substr(6);
+                    else if (body.compare(0, 9, "modstart ") == 0) lastStart = body.substr(9);
+                    bpos = eol + 1;
+                }
+                // 리뷰 F1: title-lost 는 '로딩 진입'이지만 인게임 내내 유지된다 --
+                // 사망 시각(lastlog_prev mtime, 5초 스냅샷이라 ±5초)과 title-lost
+                // 시각(blackbox_prev mtime = 마지막 append)을 비교해, 5분 넘게
+                // 지났으면 '로딩 중'이 아니라 '플레이 중' 사망으로 판정한다.
+                bool inGame = false;
+                if (lastPhase == "title-lost")
+                {
+                    ULONGLONG bbM = 0, llM = 0;
+                    WIN32_FILE_ATTRIBUTE_DATA fa;
+                    if (GetFileAttributesExW(bp, GetFileExInfoStandard, &fa))
+                        bbM = ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) |
+                              fa.ftLastWriteTime.dwLowDateTime;
+                    wchar_t lp2[MAX_PATH * 2];
+                    modRootPath(lp2);
+                    lstrcatW(lp2, L"lastlog_prev.txt");
+                    if (GetFileAttributesExW(lp2, GetFileExInfoStandard, &fa))
+                        llM = ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) |
+                              fa.ftLastWriteTime.dwLowDateTime;
+                    if (bbM && llM && llM > bbM && (llM - bbM) > 300ULL * 10000000ULL)
+                        inGame = true;   // FILETIME 10^7 틱 = 1초, 300초 초과 = 플레이 중
+                }
+                logf("블랙박스: 마지막 단계='%s' 마지막 시작='%s' inGame=%d",
+                     lastPhase.c_str(), lastStart.c_str(), (int)inGame);
+                if (lastPhase == "ctor" || lastPhase == "engine-init")
+                {
+                    if (!lastStart.empty())
+                    {
+                        wchar_t wn[128];
+                        utf8ToW(lastStart, wn, 128);
+                        // 리뷰 F2: 수집이 5초 주기라 '그 다음 모드'가 범인일 수도 있다
+                        swprintf(verdict, 400,
+                                 TR(L"\n\n블랙박스: 부팅(모드 시작) 단계에서 죽었습니다.\n"
+                                    L"마지막으로 시작이 기록된 모드: 『%s』 (유력)\n"
+                                    L"※ 기록이 5초 주기라 그 다음 모드가 시작 직후 죽었을 수도 있습니다.",
+                                    L"\n\nBlack box: died during startup (mod loading).\n"
+                                    L"Last mod recorded as starting: '%s' (likely)\n"
+                                    L"* Logging is 5s-periodic -- the NEXT mod to start may be the one."), wn);
+                        vNamed = true;
+                    }
+                    else if (g_safeModePakList[0])
+                    {   // 라이브 실측(20:44): pak 은 엔진 초기화 때 마운트·초기 로드된다 --
+                        // 모드 시작 전 사망 + pak 켜져 있었음 = pak 이 첫 번째 용의자.
+                        // (사용자 규칙: 블랙박스가 이름을 못 대면 pak 을 지목한다)
+                        swprintf(verdict, 400,
+                                 TR(L"\n\n블랙박스: 게임 부팅(엔진 초기화·pak 마운트) 중에 죽었습니다.\n"
+                                    L"이 단계 크래시는 pak(외형·콘텐츠) 모드가 흔한 원인입니다 -- 유력: %s",
+                                    L"\n\nBlack box: died during engine boot (pak mounting/early load).\n"
+                                    L"pak (appearance/content) mods are a common cause here -- likely: %s"),
+                                 g_safeModePakList);
+                        vNamed = true;
+                    }
+                    else
+                        swprintf(verdict, 400,
+                                 TR(L"\n\n블랙박스: 부팅 극초기 또는 모드 시작 기록이 수집되기 전에 죽었습니다.",
+                                    L"\n\nBlack box: died very early in boot, or before mod-start logging began."));
+                }
+                else if (lastPhase == "title-lost" && !inGame)
+                {
+                    if (g_safeModePakList[0])
+                    {
+                        swprintf(verdict, 400,
+                                 TR(L"\n\n블랙박스: 게임 시작/로딩 중에 죽었습니다.\n"
+                                    L"이때 죽으면 대개 pak(외형·콘텐츠) 모드입니다 -- 유력: %s",
+                                    L"\n\nBlack box: died while loading into the game.\n"
+                                    L"This usually points to pak (appearance/content) mods -- likely: %s"),
+                                 g_safeModePakList);
+                        vNamed = true;
+                    }
+                    else
+                        swprintf(verdict, 400,
+                                 TR(L"\n\n블랙박스: 게임 시작/로딩 중에 죽었습니다.",
+                                    L"\n\nBlack box: died while loading into the game."));
+                }
+                else if (lastPhase == "title-lost")   // inGame -- 이름 못 댐, 아래 '참고'가 이어진다
+                    swprintf(verdict, 400,
+                             TR(L"\n\n블랙박스: 게임 플레이 중에 죽었습니다 (로딩 단계 아님).",
+                                L"\n\nBlack box: died during gameplay (not while loading)."));
+                // lastPhase == "title": 타이틀 화면 사망 -- 이름 못 댐, 아래 참고로
+            }
+        }
+        // v0.24 '마지막으로 기록을 남긴 모드'는 **로그에만** 남긴다 (사용자 지시
+        // 2026-08-13: 지금은 기록을 남기는 모드가 자작 모드뿐이라, 팝업에 넣으면
+        // 항상 자작 모드가 뒤집어쓴다 -- 생태계가 생기기 전엔 팝업 금지).
+        (void)vNamed;
         Suspect s;
-        wchar_t clock[16] = {0};
         if (findCrashSuspect(prevLaunch, &s))
         {
+            wchar_t clock[16] = {0};
             ftToClock(s.when, clock, 16);
-            const wchar_t* disp = s.label[0] ? s.label : s.name;
-            logf("다잉 메시지: '%s' 가 %s 에 마지막 기록 -- \"%s\"",
+            logf("다잉 메시지: '%s' 가 %s 에 마지막 기록 -- \"%s\" (팝업 미표시)",
                  u8(s.name).c_str(), u8(clock).c_str(), u8(s.lastLine).c_str());
-            swprintf(g_safeModeText, 480,
-                     TR(L"직전 실행이 비정상 종료되어 모드 %d개를 껐습니다.\n\n"
-                        L"마지막으로 기록을 남긴 모드: 『%s』 (%s)\n%.90s\n\n"
-                        L"※ 확정 원인은 아닙니다. 기록이 잦은 모드가 뽑힐 수 있습니다.",
-                        L"The previous run ended abnormally, so %d mod(s) were switched off.\n\n"
-                        L"Last mod to write a log: '%s' (%s)\n%.90s\n\n"
-                        L"* Not proof of cause -- a chatty mod can get picked by accident."),
-                     off, disp, clock, s.lastLine);
         }
-        else
-        {
-            swprintf(g_safeModeText, 480,
-                     TR(L"직전 실행이 비정상 종료되어 모드 %d개를 껐습니다.\n"
-                        L"어느 모드가 마지막으로 동작했는지는 확인하지 못했습니다.\n"
-                        L"게임 자체 문제였다면 매니저에서 다시 켜면 됩니다.",
-                        L"The previous run ended abnormally, so %d mod(s) were switched off.\n"
-                        L"Could not tell which mod was active last.\n"
-                        L"If it was the game itself, just re-enable them here."), off);
-        }
+        swprintf(g_safeModeText, 768,
+                 TR(L"직전 실행이 비정상 종료되어 다음 모드 %d개를 껐습니다:\n%s%s",
+                    L"The previous run ended abnormally; these %d mod(s) were switched off:\n%s%s"),
+                 off, g_safeModeList,
+                 verdict[0] ? verdict : pakNote);
     }
     g_safeModePending.store(true, std::memory_order_relaxed);
 }
@@ -3205,7 +4581,8 @@ static bool optVisible(PlgRow& r, int oi, int depth = 0)
 static int optDepth(PlgRow& r, int oi, int depth = 0)
 {
     PlgOpt& o = r.opt[oi];
-    if (!o.parent[0] || depth > 4) return depth;
+    if (!o.parent[0] || depth > 4)
+        return (o.iniBacked && !o.iniHeader) ? depth + 1 : depth;  // v0.50: ini 자식 한 단 들여씀
     int pi = optIndexOf(r, o.parent);
     if (pi < 0 || pi == oi) return depth;
     return optDepth(r, pi, depth + 1);
@@ -3314,6 +4691,8 @@ static void closePanel(const char* why);  // 아래 패널 절에 정의
 static bool panelInputMode(bool uiOnly, UObject* focusW = nullptr);  // 아래 정의 (기본값은 여기만)
                                                                       // 반환 = 전환 호출 실제 성공
 static int adoptAndAlign(UObject* clone, UObject* box, UObject* exitW);  // v0.40 10차: 아래 정의
+static bool ensureRoot();  // v0.50c: 아래 정의 (키퍼 재선정 잇기)
+static bool cloneInAnyRootArray(UObject* clone);  // v0.50e: 상시 감시용 (아래 정의)
 static void probeNavGraph(UObject* root);   // v0.40 10차g: 내비 그래프 재탐색용
 
 static void cloneLost(const char* why)
@@ -3376,6 +4755,12 @@ static void cloneLost(const char* why)
     g_doneBox = nullptr;
     g_lastHover = false;
     g_padIcon = nullptr;     // 11b: 클론과 함께 죽는다 (죽은 위젯 토글 금지)
+    g_padIconSpacer = nullptr;
+    g_reorderPending = false;   // v0.50: 위치 원복 예약도 메뉴와 함께 취소
+    g_reorderRepair = false;    // v0.50(C-2): Exit 수리 모드도 메뉴와 함께 리셋
+    g_reorderHaveSaved = false;
+    g_reorderOpenTicks = 0;
+    blackboxPhase("title-lost");  // v0.50: 블랙박스 -- 게임시작/이어하기 로딩 진입(추정)
     g_siblings.clear();
     g_root = nullptr;        // 뿌리/편입 상태는 메뉴와 함께 죽는다
     g_rootArrOff = -1;
@@ -3559,23 +4944,28 @@ static void wireNav(UObject* clone, UObject* settings, UObject* exitW, bool quie
         }
         else if (!quiet) logf("navwire: bIsFocusable 프로퍼티 없음");
     }
-    bool up = navRule(clone, 2, settings ? settings : exitW);
-    bool dn = navRule(clone, 3, exitW);
-    if (settings && settings != exitW) navRule(settings, 3, clone);   // 설정.Down = 클론
-    if (exitW) navRule(exitW, 2, clone);                              // 나가기.Up = 클론
-    g_navWired = up && dn;
-    if (!quiet)
-        logf("navwire: 클론.Up=%d 클론.Down=%d wired=%d", (int)up, (int)dn, (int)g_navWired);
+    /* ★ v0.50 (2026-08-17): **게임 위젯의 방향 이동 규칙을 덮어쓰던 코드를 걷어냈다.**
 
-    // v0.40 11차: 실측 재해석 -- 순회의 포커스 대상은 항목 위젯이 아니라 그 안쪽
-    // 버튼(TitleMenuBtn@0x350, DButton)이다. 근거: 항목 OnFocusReceived=0 인데
-    // keyrecv(OnKeyDown)는 항목/레이어/패널에 버블링으로 뜬다 = 포커스는 안쪽 버튼,
-    // 키는 위로 버블. Slate 방향 내비가 이 버튼들 사이를 돈다(랩어라운드). 지금까지
-    // 규칙을 항목에 건 것이 헛발이었다. 이번엔 버튼끼리 명시 규칙 + 클론 버튼 포커스.
-    UObject* cBtn = readObjProp(clone, L"TitleMenuBtn", "navbtn");
-    UObject* sBtn = (settings && settings != exitW) ? readObjProp(settings, L"TitleMenuBtn", "navbtn") : nullptr;
-    UObject* eBtn = exitW ? readObjProp(exitW, L"TitleMenuBtn", "navbtn") : nullptr;
-    if (cBtn)
+       무엇을 했었나: `나가기.Down = 우리 클론`, `게임시작.Up = 우리 클론`(항목과
+       내부 버튼 양쪽)을 `SetNavigationRuleExplicit` 로 게임 위젯에 박았다.
+
+       왜 지운다:
+       1. **이득이 0 이다.** 패드 진입은 전용 Y 버튼으로 확정됐고(v0.40 11차),
+          순회 편입(adopt)은 봉인돼 있다(`g_adoptEnabled=false`). 이 배선이
+          작동한다는 증거는 끝내 없었다.
+       2. **배치와 어긋난다.** 이 규칙들은 v0.50b '클론 맨 아래' 기준인데, 지금
+          클론은 설정↔나가기 사이다. 즉 게임 메뉴에 **틀린 이동 규칙**을 박고 있었다.
+       3. **위험이 실재한다.** 클론은 재정렬이 끝날 때까지 Collapsed 이고(은신),
+          재정렬이 실패/시간초과할 수도 있다. 접힌 위젯으로 가는 규칙은 **막다른 길**이
+          된다. 게다가 게임시작 위젯을 못 찾으면(`play=0` 실측) `나가기.Down` 만
+          걸려 **되돌아올 랩이 없다**.
+       → "모드매니저를 깔면 컨트롤러로 메뉴 이동이 안 된다"는 제보를 만들 수 있는
+          **유일한 경로**였다. 남의 위젯은 건드리지 않는다.
+
+       남기는 것: 우리 클론(과 그 버튼)의 `bIsFocusable` 뿐 -- 우리 위젯에만 닿고
+       게임 순회를 바꾸지 않는다. */
+    g_navWired = false;
+    if (UObject* cBtn = readObjProp(clone, L"TitleMenuBtn", "navbtn"))
     {
         int off = propOffset(cBtn, L"bIsFocusable", 1, "navbtn");
         if (off >= 0)
@@ -3585,15 +4975,11 @@ static void wireNav(UObject* clone, UObject* settings, UObject* exitW, bool quie
             writeByteGuard(cBtn, off, 1);
             if (!quiet) logf("navbtn: 클론버튼 bIsFocusable off=0x%X %d -> 1", off, (int)before);
         }
-        bool bu = navRule(cBtn, 2, sBtn ? sBtn : eBtn);
-        bool bd = navRule(cBtn, 3, eBtn ? eBtn : sBtn);
-        if (sBtn) navRule(sBtn, 3, cBtn);   // 설정버튼.Down = 클론버튼
-        if (eBtn) navRule(eBtn, 2, cBtn);   // 나가기버튼.Up = 클론버튼
-        if (!quiet)
-            logf("navbtn: cBtn=%p sBtn=%p eBtn=%p 클론버튼.Up=%d Down=%d",
-                 (void*)cBtn, (void*)sBtn, (void*)eBtn, (int)bu, (int)bd);
     }
-    else if (!quiet) logf("navbtn: 클론 TitleMenuBtn 없음 -- 버튼 배선 생략");
+    else if (!quiet) logf("navbtn: 클론 TitleMenuBtn 없음");
+    (void)settings;
+    (void)exitW;
+    if (!quiet) logf("navwire: 게임 위젯 내비 규칙은 건드리지 않는다 (v0.50 제거)");
 }
 
 static void closePanel(const char* why)
@@ -3657,6 +5043,9 @@ static bool openPanel(UObject* clone)
 {
     logf("panel: open 시작");
     loadSessionMods();  // v0.7: 재시작 필요 판정용 세션 스냅샷
+    // v0.50: 게임 실행 중에 넣은 모드(켜진 채 배포된 zip 포함)의 진입점을 만들어 둔다.
+    // 이번 실행에는 못 싣지만, 이제 껐다 켤 필요 없이 **재시작만 하면** 로드된다.
+    reconcileEntryPoints("패널 열기");
 
     UObject* pc = UOG::FindFirstOf(L"PlayerController");
     g_pcPanel = (void*)pc;               // v0.40: 입력모드 전환/복구용
@@ -4499,6 +5888,23 @@ static bool openPanel(UObject* clone)
                 }
                 if (UObject* hb2 = addRow(r.label[0] ? r.label : r.name, "panel.rowMod"))
                 {
+                    // v0.50(TODO 11): "켜짐인데 이번 세션 미로드" 배지 -- 서드파티 zip 이
+                    // enabled.txt 를 담은 채 오면 켜짐으로 보여도 실제로는 안 돌고 있다
+                    // (UE4SS 는 부팅 때만 시작). 넥서스 리포트의 "켜짐인데 적용 안 됨" 해소.
+                    // pak 은 세션 로드 개념이 없어 제외. 배치는 실측 검증된 modKind 와 동일.
+                    if ((luaMod || cppMod) && r.on && !sessionLoaded(r.name))
+                    {
+                        if (UObject* nb = spawn(tCls, "panel.modKind"))
+                        {
+                            setVisibility(nb, 4, "panel.modKind");
+                            setTextOn(nb, TR(L"재시작 필요", L"needs restart"), "panel.modKind");
+                            setTextColor(nb, {0.95f, 0.65f, 0.25f, 1.0f}, "panel.modKind");
+                            applyFontScaled(nb, 0.8f);
+                            UObject* ns = addChildTo(hb2, nb, "panel.modKind");
+                            slotAlign(ns, -1, 2, "panel.modKind");
+                            slotPad(ns, 0, 0, 20, 0, "panel.modKind");
+                        }
+                    }
                     {   // v0.40: 모드 종류 (Lua / C++ / pak) -- 라벨과 토글 사이 (실측 mod1.png)
                         const wchar_t* kindTxt = ents[k].pak ? L"pak" : (cppMod ? L"C++" : L"Lua");
                         if (UObject* kt = spawn(tCls, "panel.modKind"))
@@ -4564,7 +5970,7 @@ static bool openPanel(UObject* clone)
                                     else slotAlign(addChildTo(rowBox, band, "panel.optBand"), 0, 0, "panel.optBand");
                                     g_lastRowOutline = selOut;
                                     g_lastRowBox = rowBox;
-                                    navAdd(NAVK_OPT, g_plgN, oi);
+                                    if (o.type != 7) navAdd(NAVK_OPT, g_plgN, oi);  // v0.50: ini 표시행 제외
                                 }
                                 UObject* hbO = spawn(hCls, "panel.optHb");
                                 if (!hbO) break;
@@ -4575,6 +5981,8 @@ static bool openPanel(UObject* clone)
                                     setVisibility(lbl, 4, "panel.optLbl");
                                     setTextOn(lbl, o.label, "panel.optLbl");
                                     setTextColor(lbl, {0.62f, 0.66f, 0.70f, 1.0f}, "panel.optLbl");
+                                    if (o.type == 7 && o.iniHeader)  // v0.50: 섹션/안내 행은 밝게
+                                        setTextColor(lbl, {0.82f, 0.86f, 0.90f, 1.0f}, "panel.optLbl");
                                     applyFontScaled(lbl, 0.85f);
                                     UObject* ls = addChildTo(hbO, lbl, "panel.optLbl");
                                     slotAlign(ls, -1, 2, "panel.optLbl");
@@ -4625,6 +6033,10 @@ static bool openPanel(UObject* clone)
                                 else if (o.type == 0)
                                 {
                                     makeToggle(hbO, &o.boolOff, &o.boolOn, &o.boolOffText, &o.boolOnText);
+                                }
+                                else if (o.type == 7)
+                                {
+                                    // v0.50: ini 표시 전용(헤더/구분/읽기전용) -- 컨트롤 없음
                                 }
                                 else
                                 {
@@ -4991,6 +6403,7 @@ static void closePopup(const char* why)
 {
     g_popupOpen = false;
     g_hsPop[0] = g_hsPop[1] = nullptr;
+    g_popupPadIcon = nullptr;   // v0.50: 팝업과 함께 죽는다
     void* p = g_popup;
     g_popup = nullptr;
     if (p)
@@ -5013,6 +6426,7 @@ static void closePopup(const char* why)
 static bool showRestartPopup(const wchar_t* desc = nullptr)
 {
     if (g_popupOpen) return true;
+    g_popupPadIcon = nullptr;   // v0.50 리뷰: 실패 경로가 스테일 포인터를 남기지 않게
     const wchar_t* descText = desc ? desc : TR(L"모드 적용을 위해 게임 재시작이 필요합니다.",
                                                L"A game restart is needed to apply the mod.");
     // v0.25: 띄운 문구를 그대로 로그에 남긴다 -- 사용자가 팝업을 닫아 버려도
@@ -5095,6 +6509,7 @@ static bool showRestartPopup(const wchar_t* desc = nullptr)
     UObject* tCls = findObj(L"/Script/UMG.TextBlock", "popup");
     UObject* sCls = findObj(L"/Script/UMG.SizeBox", "popup");
     UObject* vCls = findObj(L"/Script/UMG.VerticalBox", "popup");
+    UObject* hCls = findObj(L"/Script/UMG.HorizontalBox", "popup");
     if (!gs || !hostCls || !bCls || !tCls || !sCls || !vCls) return false;
     UObject* host = createW(hostCls);
     if (!host) return false;
@@ -5111,6 +6526,24 @@ static bool showRestartPopup(const wchar_t* desc = nullptr)
         memcpy(&w, pb.b + (int)fnSpawn->GetReturnValueOffset(), 8);
         return reinterpret_cast<UObject*>(w);
     };
+    // v0.50: 확인 버튼에 붙일 (A) 아이콘 텍스처
+    UObject* padATex = nullptr;
+    {
+        UObject* krl = findObj(L"/Script/Engine.Default__KismetRenderingLibrary", "popup");
+        UFunction* fnImpA = krl ? fnOf(krl, L"ImportFileAsTexture2D", "popup") : nullptr;
+        if (fnImpA && (int)fnImpA->GetParmsSize() == 32)
+        {
+            static wchar_t tpA[MAX_PATH * 2];
+            assetPath(tpA, L"pad_a.png");
+            PB pb;
+            UObject* c3 = mc ? mc : host;
+            memcpy(pb.b + 0, &c3, 8);
+            FStringRaw fs{tpA, (int)wcslen(tpA) + 1, (int)wcslen(tpA) + 1};
+            memcpy(pb.b + 8, &fs, 16);
+            if (peGuard(krl, fnImpA, pb.b))
+                memcpy(&padATex, pb.b + (int)fnImpA->GetReturnValueOffset(), 8);
+        }
+    }
 
     UObject* dim = spawn2(bCls);
     if (!dim) return false;
@@ -5229,7 +6662,34 @@ static bool showRestartPopup(const wchar_t* desc = nullptr)
             setVisibility(bt, 4, "popup.ok");
             slotAlign(addChildTo(obox, outline, "popup.ok"), 0, 0, "popup.ok");
             slotAlign(addChildTo(outline, fill, "popup.ok"), 0, 0, "popup.ok");
-            slotAlign(addChildTo(fill, bt, "popup.ok"), 2, 2, "popup.ok");
+            // v0.50: 확인 텍스트 옆 (A) 아이콘 -- 패드 사용 시만 표시(패드로도 닫힘 안내)
+            UObject* okhb = hCls ? spawn2(hCls) : nullptr;
+            if (okhb)
+            {
+                slotAlign(addChildTo(okhb, bt, "popup.ok"), -1, 2, "popup.ok");
+                if (UObject* ab = spawn2(sCls))
+                {
+                    float aw = 40.0f;
+                    callBytes(ab, L"SetWidthOverride", &aw, 4, "popup.ok");
+                    callBytes(ab, L"SetHeightOverride", &aw, 4, "popup.ok");
+                    if (UObject* ai = spawn2(bCls))
+                    {
+                        if (padATex) callBytes(ai, L"SetBrushFromTexture", &padATex, 8, "popup.ok");
+                        setBrushColor(ai, {1, 1, 1, 1}, "popup.ok");
+                        setVisibility(ai, 4, "popup.ok");
+                        slotAlign(addChildTo(ab, ai, "popup.ok"), 0, 0, "popup.ok");
+                    }
+                    bool po = g_inputMode.load(std::memory_order_relaxed) == 1 &&
+                              g_padPresent.load(std::memory_order_relaxed);
+                    setVisibility(ab, po ? 4 : 1, "popup.ok");
+                    g_popupPadIcon = (void*)ab;
+                    UObject* asl = addChildTo(okhb, ab, "popup.ok");
+                    slotAlign(asl, -1, 2, "popup.ok");
+                    slotPad(asl, 10, 0, 0, 0, "popup.ok");
+                }
+                slotAlign(addChildTo(fill, okhb, "popup.ok"), 2, 2, "popup.ok");
+            }
+            else slotAlign(addChildTo(fill, bt, "popup.ok"), 2, 2, "popup.ok");
             okOutline = outline;
         }
         UObject* s = addChildTo(pvb, obox, "popup.ok");
@@ -6006,10 +7466,10 @@ static void checkModNotifications(ULONGLONG now)
                 if (!nm.empty()) utf8ToW(nm, disp, 64);
             }
         }
-        static wchar_t msgW[240];
+        static wchar_t msgW[512];
         if (msgA.empty() || _stricmp(msgA.c_str(), "restart") == 0)
         {
-            swprintf(msgW, 240, TR(L"『%s』 변경 사항은 게임 재시작 후 적용됩니다.",
+            swprintf(msgW, 512, TR(L"『%s』 변경 사항은 게임 재시작 후 적용됩니다.",
                                L"Changes to '%s' take effect after the game restarts."),
                      disp[0] ? disp : ents[k].name);
         }
@@ -6018,10 +7478,21 @@ static void checkModNotifications(ULONGLONG now)
             // v0.40: 발신자를 밝힌다 -- 발신자 없는 문구는 매니저/게임의 말처럼
             // 읽힌다 (실측 2026-08-10: AutoFood 의 "게임이 업데이트되어..." 를
             // 매니저/게임 탓으로 오인). 모드가 보낸 문구 앞에 이름을 붙인다.
-            if (msgA.size() > 200) msgA.resize(200);
-            wchar_t body[160];
-            utf8ToW(msgA, body, 160);
-            swprintf(msgW, 240, TR(L"『%s』 모드의 안내:\n%s", L"From mod '%s':\n%s"),
+            // ★ v0.50 실측 2026-08-17: 상한이 **200바이트**여서 한글(3바이트/자)은
+            // 66자에서 잘렸다 -- AutoFood 안내가 "...모드 업데이트" 에서 끊겨 표시됨.
+            // 팝업은 자동 줄바꿈·높이 조절이 되므로(v0.25) 넉넉히 준다.
+            // ⚠ 바이트로 자르면 다중바이트 문자 중간이 잘려 깨진다 -- **문자 경계**에서 자른다.
+            const size_t LIMIT = 600;
+            if (msgA.size() > LIMIT)
+            {
+                size_t cut = LIMIT;
+                while (cut > 0 && ((unsigned char)msgA[cut] & 0xC0) == 0x80) --cut;  // 이어바이트면 뒤로
+                msgA.resize(cut);
+                msgA += "...";
+            }
+            wchar_t body[320];
+            utf8ToW(msgA, body, 320);
+            swprintf(msgW, 512, TR(L"『%s』 모드의 안내:\n%s", L"From mod '%s':\n%s"),
                      disp[0] ? disp : ents[k].name, body);
         }
         logf("notify: '%s' 재시작 안내 신호 수신", u8(ents[k].name).c_str());
@@ -6065,15 +7536,37 @@ static void navPaintSel(int oldSel, int newSel)
                       {1, 1, 1, 1}, "nav-sel");
 }
 
-static void navEnsureVisible(int sel)
+/* ★ v0.50 실측 2026-08-17 (라이브): 패널을 새로 연 직후 패드로 쭉 내리면 화면 밖
+   행부터 **스크롤이 안 따라가** 선택이 보이지 않는 곳으로 사라졌다. 마우스로 한 번
+   굴린 뒤에는 정상 동작.
+   원인: `widgetRectAbs` 는 `GetCachedGeometry` 를 쓰는데, Slate 는 **그려진 적 없는
+   위젯의 캐시 크기를 0 으로 준다**(뷰포트 밖은 컬링돼 페인트를 안 탄다). 그래서
+   `sx<=0` 로 **false** 가 나고 이 함수가 통째로 조기 반환했다 = 스크롤 없음.
+   마우스로 굴리면 그 행들이 그려져 캐시가 생기고, 그 뒤로는 잘 됐던 것.
+   해법: 목표 행의 좌표를 못 얻으면 **이동 방향으로 한 칸 밀어** 배치를 유도한다.
+   한 번 그려지고 나면 아래 정밀 경로가 이어받는다. 마지막 행처럼 뒤이은 이동이
+   없는 경우를 위해 호출자가 잠깐 재확인(settle)한다. */
+static ULONGLONG g_navSettleUntil = 0;   // 이 시각까지 정밀 재확인 (패드 모드에서만)
+
+static void navEnsureVisible(int sel, int dir = 0)
 {
     if (g_pendScroll >= 0.0f) return;   // v0.40: 복원이 진행 중이면 양보
-    if (sel < 0 || sel >= g_navN || !g_nav[sel].rowBox || !g_scrollBox) return;
-    double rx0, ry0, rx1, ry1, sx0, sy0, sx1, sy1;
-    if (!widgetRectAbs(reinterpret_cast<UObject*>(g_nav[sel].rowBox), &rx0, &ry0, &rx1, &ry1)) return;
-    if (!widgetRectAbs(reinterpret_cast<UObject*>(g_scrollBox), &sx0, &sy0, &sx1, &sy1)) return;
+    if (sel < 0 || sel >= g_navN || !g_scrollBox) return;
     float cur = readScrollOffset(g_scrollBox);
     if (cur < 0) cur = 0;
+    double rx0, ry0, rx1, ry1, sx0, sy0, sx1, sy1;
+    bool haveRow = g_nav[sel].rowBox &&
+                   widgetRectAbs(reinterpret_cast<UObject*>(g_nav[sel].rowBox), &rx0, &ry0, &rx1, &ry1);
+    if (!haveRow)
+    {
+        // 아직 한 번도 그려지지 않은 행 -- 위치를 알 수 없다. 방향으로 한 칸 민다.
+        if (!dir) return;
+        float want = cur + (dir > 0 ? 96.0f : -96.0f);
+        if (want < 0) want = 0;
+        if (want != cur) writeScrollOffset(g_scrollBox, want);
+        return;
+    }
+    if (!widgetRectAbs(reinterpret_cast<UObject*>(g_scrollBox), &sx0, &sy0, &sx1, &sy1)) return;
     float want = cur;
     if (ry0 < sy0) want = cur - (float)(sy0 - ry0) - 20.0f;
     else if (ry1 > sy1) want = cur + (float)(ry1 - sy1) + 20.0f;
@@ -6197,7 +7690,9 @@ static bool padPanelInput(unsigned pe, UObject* clone)
         if (ns >= g_navN) ns = g_navN - 1;
         g_navSel = ns;
         navPaintSel(oldSel, ns);
-        navEnsureVisible(ns);
+        navEnsureVisible(ns, dir);
+        // 방금 민 행이 이번 프레임에 그려지면 다음 틱에 정확히 맞춘다 (마지막 행 대비)
+        g_navSettleUntil = GetTickCount64() + 600;
         return false;
     }
     if (g_navSel < 0 || g_navSel >= g_navN) return false;
@@ -6258,7 +7753,8 @@ static bool padPanelInput(unsigned pe, UObject* clone)
             paintToggle(r);
             applyPluginState(r);
             bool pop = r.on && !sessionLoaded(r.name);
-            if (r.optN)
+            // v0.50: 미로드 모드는 옵션이 없어도 재구축 -- '재시작 필요' 배지 갱신
+            if (r.optN || !sessionLoaded(r.name))
             {
                 rebuildPanel(clone, "모드 토글(패드)");
                 navAfterRebuild();
@@ -6491,6 +7987,17 @@ static void pump(ULONGLONG now)
 
     if (g_popupOpen)  // 팝업이 최상위 모달
     {
+        if (g_popupPadIcon)
+        {   // v0.50: 팝업 (A) 아이콘도 패드 사용 중에만
+            bool po = g_inputMode.load(std::memory_order_relaxed) == 1 &&
+                      g_padPresent.load(std::memory_order_relaxed);
+            static int s_popIco = -1;
+            if ((int)po != s_popIco)
+            {
+                s_popIco = (int)po;
+                setVisibility(reinterpret_cast<UObject*>(g_popupPadIcon), po ? 4 : 1, "popup.padtog");
+            }
+        }
         {   // v0.40(pad): A = 확인. 그 외 패드 엣지는 버린다 -- 쌓아두면 팝업이
             // 닫힌 뒤 묵은 엣지가 재생된다 (리뷰 확정: 켠 모드가 도로 꺼졌다)
             unsigned pe = g_padEdges.exchange(0, std::memory_order_relaxed);
@@ -6548,6 +8055,13 @@ static void pump(ULONGLONG now)
                 if (cur >= g_pendScroll - 1.0f) g_pendScroll = -1.0f;  // 닿음(또는 최대치)
                 else writeScrollOffset(g_scrollBox, g_pendScroll);
             }
+        }
+        // v0.50: 패드 이동 직후 잠깐 정밀 재확인 -- 방금 밀어서 그려진 행의 진짜
+        // 좌표가 이제야 잡히므로 여기서 정확히 맞춘다 (마지막 행도 제자리에 온다).
+        if (g_navSettleUntil && g_inputMode.load(std::memory_order_relaxed) == 1)
+        {
+            if (now > g_navSettleUntil) g_navSettleUntil = 0;
+            else navEnsureVisible(g_navSel, 0);
         }
         // v0.40(pad): 장치 전환 표시 동기화 -- 패드 UI(칩·힌트·테두리)는 패드를
         // 쓸 때만 보이고, 키/마 입력이 오면 즉시 사라진다 (게임 설정창 실측).
@@ -7280,7 +8794,8 @@ static void pump(ULONGLONG now)
                         r.on = false;
                         paintToggle(r);
                         applyPluginState(r);
-                        if (r.optN) needReopen = true;  // 옵션 서브행 접기
+                        // v0.50: 미로드 모드는 옵션 없어도 재구축 ('재시작 필요' 배지 갱신)
+                        if (r.optN || !sessionLoaded(r.name)) needReopen = true;  // 옵션 서브행 접기
                     }
                 }
                 else if (kind == ARM_MOD_ON)
@@ -7290,7 +8805,8 @@ static void pump(ULONGLONG now)
                         r.on = true;
                         paintToggle(r);
                         applyPluginState(r);
-                        if (r.optN) needReopen = true;  // 옵션 서브행 펼치기
+                        // v0.50: 미로드 모드는 옵션 없어도 재구축 ('재시작 필요' 배지 갱신)
+                        if (r.optN || !sessionLoaded(r.name)) needReopen = true;  // 옵션 서브행 펼치기
                         // 이번 세션에 로드 안 된 모드를 켬 = 재시작해야 적용 -> 게임식 팝업
                         if (!sessionLoaded(r.name)) needPopup = true;
                     }
@@ -7408,11 +8924,137 @@ static void pump(ULONGLONG now)
             if (g_padIcon)
                 setVisibility(reinterpret_cast<UObject*>(g_padIcon), padActive ? 4 : 1, "padico.tog");
         }
+        // v0.50: 위치 원복 -- 게임의 Exit 로컬라이즈가 안정(라벨 무변화 0.8초)된
+        // 뒤 1회 재정렬해 클론을 설정<->나가기 사이로. Exit 라벨은 재정렬 순간 캡처해
+        // 복원(remove+readd 가 라벨을 기본값으로 되돌리므로). 안정 대기로 로컬라이즈
+        // 완료 후 캡처가 보장된다(영어판 "나가기" 오류의 뿌리 = 너무 이른 캡처였다).
+        // 정렬이 끝날 때까지 클론은 Collapsed(finishClone) -- 완료/실패/시간초과
+        // 어느 경로든 반드시 Visible(0) 복귀시킨다 (숨은 채 남으면 메뉴에서 실종).
+        if (g_reorderPending)
+        {
+            // 이 블록은 게이트(팝업·패널 닫힘)가 열렸을 때만 도니, 틱 수 = 실제로
+            // 재정렬을 시도할 수 있었던 시간이다 (150ms 간격 x 33 = 약 5초).
+            if (++g_reorderOpenTicks > 33)
+            {   // 안전망: Exit 라벨을 끝내 못 읽거나 계속 흔들리면 포기 -- 맨 아래로라도 표시
+                g_reorderPending = false;
+                setVisibility(clone, 0, "reorderShow");
+                logf("WARN reorder: 시간초과(열린 틱 %d) -- 재정렬 포기, 맨 아래 표시", g_reorderOpenTicks);
+            }
+            else
+            {
+            UObject* rbox = reinterpret_cast<UObject*>(g_doneBox.load());
+            UObject* rexit = reinterpret_cast<UObject*>(g_menuExit.load(std::memory_order_relaxed));
+            UObject* rtt = rexit ? readObjProp(rexit, L"TitleText", "reorder") : nullptr;
+            PB cur;
+            bool haveCur = false;
+            if (rtt)
+            {
+                UFunction* fg = fnOf(rtt, L"GetText", "reorder");
+                if (fg && (int)fg->GetParmsSize() == 24 && (int)fg->GetReturnValueOffset() == 0)
+                    haveCur = peGuard(rtt, fg, cur.b);
+            }
+            if (rbox && rexit && haveCur)
+            {
+                bool changed = !g_reorderHaveLast || memcmp(cur.b, g_reorderLastExit, 24) != 0;
+                if (changed)
+                {
+                    memcpy(g_reorderLastExit, cur.b, 24);
+                    g_reorderHaveLast = true;
+                    g_reorderStableSince = now;
+                }
+                else if (now - g_reorderStableSince >= 800)
+                {
+                    g_reorderPending = false;
+                    UFunction* fAdd = fnOf(rbox, L"AddChild", "reorder");
+                    UFunction* fRm = fnOf(rbox, L"RemoveChild", "reorder");
+                    if (fAdd && fRm && (int)fAdd->GetParmsSize() == 16)
+                    {
+                        int ps = (int)fRm->GetParmsSize(), ro = (int)fRm->GetReturnValueOffset();
+                        if (ps > 8 && ps <= 64 && ro >= 8 && ro < 64)
+                        {
+                            // C-2: 떼기 직전 라벨을 전역에 보관 -- 재부착이 다음
+                            // 틱(수리 모드)으로 밀려도 복원할 수 있게.
+                            memcpy(g_reorderSavedLabel, cur.b, 24);
+                            g_reorderHaveSaved = true;
+                            PB pb;
+                            memcpy(pb.b, &rexit, 8);
+                            bool removed = peGuard(rbox, fRm, pb.b) && pb.b[ro] != 0;
+                            if (removed)
+                            {
+                                void* slot = nullptr;
+                                int aro = (int)fAdd->GetReturnValueOffset();
+                                for (int at = 0; at < 3 && !slot; ++at)
+                                {
+                                    PB pb2;
+                                    memcpy(pb2.b, &rexit, 8);
+                                    if (peGuard(rbox, fAdd, pb2.b)) memcpy(&slot, pb2.b + aro, 8);
+                                }
+                                if (slot)
+                                {
+                                    UFunction* fSet = fnOf(rtt, L"SetText", "reorder");
+                                    if (fSet && (int)fSet->GetParmsSize() == 24) peGuard(rtt, fSet, cur.b);
+                                    logf("reorder: 완료 -- 클론이 설정<->나가기 사이로 (Exit 라벨 복원)");
+                                }
+                                else
+                                {   // C-2: Exit 가 떨어진 채다 -- 수리 모드로 틱마다 재부착 시도
+                                    g_reorderRepair = true;
+                                    logf("FAIL reorder: Exit 재부착 실패(슬롯 null) -- 수리 모드 진입");
+                                }
+                            }
+                        }
+                    }
+                    // 재정렬 시도가 끝났다(성공/실패 불문) -- 클론을 반드시 보이게
+                    setVisibility(clone, 0, "reorderShow");
+                }
+            }
+            }
+            if (g_reflFault) { cloneLost("위치 원복 SEH"); return; }
+        }
+        // v0.50(리뷰 C-2): 재부착 수리 -- RemoveChild(Exit) 성공 후 AddChild 실패로
+        // Exit(나가기)가 메뉴에서 떨어진 채면, 붙을 때까지 틱마다 재시도한다.
+        // 메뉴가 죽으면 cloneLost 가 리셋하고, 재부착 성공 시 보관해 둔 라벨 복원.
+        if (g_reorderRepair)
+        {
+            UObject* rbox2 = reinterpret_cast<UObject*>(g_doneBox.load());
+            UObject* rexit2 = reinterpret_cast<UObject*>(g_menuExit.load(std::memory_order_relaxed));
+            if (rbox2 && rexit2)
+            {
+                UFunction* fAdd2 = fnOf(rbox2, L"AddChild", "reorder.fix");
+                if (fAdd2 && (int)fAdd2->GetParmsSize() == 16)
+                {
+                    PB pb3;
+                    memcpy(pb3.b, &rexit2, 8);
+                    void* slot2 = nullptr;
+                    if (peGuard(rbox2, fAdd2, pb3.b))
+                        memcpy(&slot2, pb3.b + (int)fAdd2->GetReturnValueOffset(), 8);
+                    if (slot2)
+                    {
+                        g_reorderRepair = false;
+                        if (g_reorderHaveSaved)
+                            if (UObject* rtt2 = readObjProp(rexit2, L"TitleText", "reorder.fix"))
+                            {
+                                UFunction* fSet2 = fnOf(rtt2, L"SetText", "reorder.fix");
+                                if (fSet2 && (int)fSet2->GetParmsSize() == 24)
+                                    peGuard(rtt2, fSet2, g_reorderSavedLabel);
+                            }
+                        logf("reorder: 수리 성공 -- 떨어졌던 Exit 재부착 (라벨 복원)");
+                    }
+                }
+            }
+            if (g_reflFault) { cloneLost("Exit 수리 SEH"); return; }
+        }
         int lt = readGameLangText();
         bool cultureFlip = (lt >= 0 && s_lastLangText != -2 && lt != s_lastLangText);
         bool langChanged = recheckLang(lt);
         if (cultureFlip || langChanged || s_lastLangText == -2)
+        {
             setLabel(clone, "keep", false);
+            if (g_padIconSpacer)
+            {   // v0.50b: 라벨 폭이 언어마다 달라 아이콘 간격도 언어별로 갱신
+                float spw = (g_lang == 1) ? 300.0f : 240.0f;
+                callBytes(reinterpret_cast<UObject*>(g_padIconSpacer), L"SetWidthOverride", &spw, 4, "padico.sp");
+            }
+        }
         if (lt >= 0) s_lastLangText = lt;
         else if (s_lastLangText == -2) s_lastLangText = -1;   // 첫 틱 재주장은 1회만
         if (g_reflFault) { cloneLost("라벨 키퍼 SEH"); return; }
@@ -7535,20 +9177,21 @@ static void pump(ULONGLONG now)
                 s_navRetryMs = now;
                 probeNavGraph(reinterpret_cast<UObject*>(g_root));
             }
-            // 편입 재시도(2초): 배열이 늦게 채워지는 유형 대비 -- num>0 이 됐을 때만 본시도
-            if (!g_rootAdopted && !g_vstop && g_root && g_rootArrOff >= 0 &&
-                now - s_adoptRetryMs >= 2000)
+            // v0.50e 편입 상시 감시(2초): 게임이 배열을 자기 손으로 재구축하면
+            // (설정 왕복 경로, 00:23 실측) 우리 클론이 빠진다 -- 들어있는지 확인하고
+            // 없으면 재편입. v0.50c 의 "성공 후 감시 중단"이 설정 왕복 실패의 원인.
+            if (g_adoptEnabled && !g_vstop && now - s_adoptRetryMs >= 2000)
             {
                 s_adoptRetryMs = now;
-                struct { void* data; int num; int max; } ah{};
-                if (readBytesGuard(g_root, g_rootArrOff, &ah, 16) &&
-                    ah.data && ah.num > 0 && ah.max >= ah.num)
+                if (cloneInAnyRootArray(clone)) g_rootAdopted = true;
+                else
                 {
                     UObject* bx = reinterpret_cast<UObject*>(g_doneBox.load());
                     UObject* ex = reinterpret_cast<UObject*>(g_menuExit.load(std::memory_order_relaxed));
                     if (bx && ex)
                     {
-                        logf("adopt: 배열이 채워짐 (num=%d) -- 편입 재시도", ah.num);
+                        if (g_rootAdopted)
+                            logf("adopt: 배열에서 클론 소실(게임 재구축 추정) -- 재편입");
                         int ad = adoptAndAlign(clone, bx, ex);
                         if (ad < 0) return;
                         g_rootAdopted = (ad == 1);
@@ -7797,6 +9440,18 @@ static void pump(ULONGLONG now)
                          frozen ? ", 동결 연장" : "");
                     return;
                 }
+            }
+        }
+        // v0.50b: 게임 네이티브 확정(클론 선택 + A, 또는 클릭) -- OnClickedButton 편승
+        {
+            unsigned long long ck = g_cloneClickedMs.exchange(0, std::memory_order_relaxed);
+            if (ck && now - ck < 600)
+            {
+                logf("menu: 클론 확정(OnClickedButton) -- 패널 연다");
+                g_navSel = -1;
+                openPanel(clone);
+                if (g_reflFault) cloneLost("패널 생성 중 SEH");
+                return;
             }
         }
         if (fresh && (pe & PAD_Y))
@@ -8062,20 +9717,32 @@ static bool ensureRoot()
     if (g_root && g_rootArrOff >= 0) return true;
     std::vector<UObject*> found;
     UOG::FindAllOf(L"DLayerTitleGame_C", found);
+    // v0.50d: 다중 인스턴스 대비 -- 뿌리의 VerticalBox_BotButtons 가 우리가 쥔
+    // 메뉴 박스(g_doneBox = Exit.GetParent())와 일치하는 인스턴스가 진짜 라이브다.
+    // (항목 포인터는 부팅 경로에선 끝내 null 실측 -- 검증 기준으로 못 쓴다)
+    void* liveBox = g_doneBox.load();
     UObject* cand = nullptr;
+    UObject* first = nullptr;
     for (UObject* o : found)
     {
         if (!o) continue;
         std::wstring full = o->GetFullName(nullptr);
         if (wcontains(full, L"Default__")) continue;
-        cand = o;
-        break;
+        if (!first) first = o;
+        if (liveBox && readObjProp(o, L"VerticalBox_BotButtons", "root") == (UObject*)liveBox)
+        {
+            cand = o;
+            break;
+        }
     }
+    bool boxMatched = cand != nullptr;
+    if (!cand) cand = first;
     if (!cand)
     {
         logf("WARN root: DLayerTitleGame_C 라이브 인스턴스 없음");
         return false;
     }
+    logf("root: 후보 %d개, 박스일치=%d", (int)found.size(), (int)boxMatched);
     int off = propOffset(cand, L"ListTitleMenuBtn", 16, "root");
     if (off < 0)
     {
@@ -8092,112 +9759,154 @@ static bool ensureRoot()
     return true;
 }
 
-// 게임 항목 배열에 클론 편입. true = 배열에 있음(이번에 넣었든 이미 있든).
-// 재할당은 엔진 FMemory 확보 시에만 -- 이종 힙 버퍼를 게임에 넘기면 지연 크래시.
-static bool tryAdoptClone(UObject* clone, UObject* liveExit)
+// v0.50e: 한 뿌리에 대한 편입 시도. 반환 1=클론이 배열에 있음(이번에 넣었든
+// 원래 있었든) / 0=실패·불가. 배열이 비었으면 부트스트랩(항목 4개는 FindAllOf
+// 라이브 목록에서 이름 식별 -- 뿌리 바인딩 프로퍼티는 부팅 경로에서 끝내 null 실측),
+// 채워져 있으면 라이브 exitW 검증 후 append. 로그에 뿌리 전체 경로를 남긴다
+// (다중 인스턴스 중 어느 쪽이 라이브인지 식별할 유일한 단서).
+static int adoptIntoRoot(UObject* root, int arrOff, UObject* clone, UObject* liveExit, int ri)
 {
-    if (!ensureRoot()) return false;
     struct ArrHdr { void* data; int num; int max; };
     ArrHdr arr{};
-    if (!readBytesGuard(g_root, g_rootArrOff, &arr, 16))
-    {
-        logf("FAIL rootarr: 헤더 읽기 AV");
-        return false;
-    }
-    UObject* root = reinterpret_cast<UObject*>(g_root);
-    static const wchar_t* itemNames[4] = {
-        L"TitleMenuBtn_PlayGame", L"TitleMenuBtn_LoadGame",
-        L"TitleMenuBtn_Option", L"TitleMenuBtn_Exit"};
-    int match = 0;
-    bool cloneIn = false;
-    bool liveIn = false;   // 방금 FindAllOf 로 얻은 라이브 exitW 가 배열에 있는가
-                           // -- 스테일(pending-kill) 뿌리의 자기일관 통과를 걸러낸다
-    if (arr.data && arr.num >= 1 && arr.num <= 16 && arr.max >= arr.num && arr.max <= 64)
-    {
-        for (const wchar_t* n : itemNames)
-        {
-            UObject* w = readObjProp(root, n, "rootarr");
-            if (!w) continue;
-            for (int jj = 0; jj < arr.num; ++jj)
-            {
-                void* e = nullptr;
-                if (readPtrGuard(arr.data, jj * 8, &e) && e == (void*)w) { ++match; break; }
-            }
-        }
+    if (!readBytesGuard(root, arrOff, &arr, 16)) return 0;
+    // 1) 이미 들어 있나 (조용)
+    if (arr.data && arr.num > 0 && arr.num <= 16)
         for (int jj = 0; jj < arr.num; ++jj)
         {
             void* e = nullptr;
-            if (!readPtrGuard(arr.data, jj * 8, &e)) continue;
-            if (e == (void*)clone) cloneIn = true;
-            if (e == (void*)liveExit) liveIn = true;
+            if (readPtrGuard(arr.data, jj * 8, &e) && e == (void*)clone) return 1;
         }
-    }
-    logf("rootarr: num=%d max=%d match=%d/4 live=%d cloneIn=%d",
-         arr.num, arr.max, match, (int)liveIn, (int)cloneIn);
-    if (cloneIn) return true;
-    if (match < 4 || !liveIn)
+    // 2) 빈 배열 -> 부트스트랩
+    if (!arr.data && arr.num == 0 && arr.max == 0)
     {
-        logf("WARN rootarr: 항목 목록 검증 실패 -- 편입 포기");
-        return false;
-    }
-    if (arr.num < arr.max)
-    {   // 여유 있음 -- 제자리 append (재할당 불필요)
-        if (!writePtrGuard(arr.data, arr.num * 8, (void*)clone) ||
-            !writeIntGuard(g_root, g_rootArrOff + 8, arr.num + 1))
+        memSelfTest();
+        if (g_memSelfTest != 1) return 0;
+        void* items[4] = {};
+        for (void* sPtr : g_siblings)
         {
-            logf("FAIL append: 제자리 쓰기 AV");
-            return false;
+            UObject* it = reinterpret_cast<UObject*>(sPtr);
+            if (!it || it == clone) continue;
+            std::wstring nm = it->GetName();
+            if (wcontains(nm, L"PlayGame")) items[0] = (void*)it;
+            else if (wcontains(nm, L"LoadGame")) items[1] = (void*)it;
+            else if (wcontains(nm, L"Option")) items[2] = (void*)it;
+            else if (wcontains(nm, L"Exit")) items[3] = (void*)it;
         }
-        logf("append: num %d->%d realloc=0", arr.num, arr.num + 1);
-        return true;
+        if (!(items[0] && items[1] && items[2] && items[3]) || items[3] != (void*)liveExit)
+        {
+            logf("WARN bootstrap[r%d]: 항목 확보 실패 -- 포기", ri);
+            return 0;
+        }
+        void* nb = nullptr;
+        if (sehEngineMalloc(5 * 8, &nb) != 0 || !nb) return 0;
+        bool ok = true;
+        for (int k = 0; k < 4 && ok; ++k) ok = writePtrGuard(nb, k * 8, items[k]);
+        if (ok) ok = writePtrGuard(nb, 4 * 8, (void*)clone);
+        if (!ok) { sehEngineFree(nb); return 0; }
+        if (!writePtrGuard(root, arrOff, nb)) { sehEngineFree(nb); return 0; }
+        if (!writeIntGuard(root, arrOff + 8, 5) || !writeIntGuard(root, arrOff + 12, 5))
+        {
+            writeIntGuard(root, arrOff + 8, 0);
+            return 0;
+        }
+        logf("bootstrap[r%d]: 배열 생성 0 -> 5  root=%s", ri, u8(root->GetFullName(nullptr)).c_str());
+        return 1;
     }
-    memSelfTest();
-    if (g_memSelfTest != 1)
+    // 3) 게임이 채운 배열 -> 검증 후 append
+    if (arr.data && arr.num >= 1 && arr.num <= 16 && arr.max >= arr.num && arr.max <= 64)
     {
-        logf("WARN append: 엔진 할당자 미확보 -- 재할당 포기");
-        return false;
+        bool liveIn = false;
+        for (int jj = 0; jj < arr.num; ++jj)
+        {
+            void* e = nullptr;
+            if (readPtrGuard(arr.data, jj * 8, &e) && e == (void*)liveExit) liveIn = true;
+        }
+        if (!liveIn)
+        {
+            static int s_stale = 0;
+            if (++s_stale <= 3) logf("WARN adopt[r%d]: 배열에 라이브 Exit 없음 -- 스테일 뿌리", ri);
+            return 0;
+        }
+        if (arr.num < arr.max)
+        {
+            if (!writePtrGuard(arr.data, arr.num * 8, (void*)clone) ||
+                !writeIntGuard(root, arrOff + 8, arr.num + 1))
+                return 0;
+            logf("append[r%d]: num %d->%d  root=%s", ri, arr.num, arr.num + 1,
+                 u8(root->GetFullName(nullptr)).c_str());
+            return 1;
+        }
+        memSelfTest();
+        if (g_memSelfTest != 1) return 0;
+        int newMax = arr.max + 4;
+        void* nb = nullptr;
+        if (sehEngineMalloc((unsigned long long)newMax * 8, &nb) != 0 || !nb) return 0;
+        bool ok = true;
+        for (int jj = 0; jj < arr.num && ok; ++jj)
+        {
+            void* e = nullptr;
+            ok = readPtrGuard(arr.data, jj * 8, &e) && writePtrGuard(nb, jj * 8, e);
+        }
+        if (ok) ok = writePtrGuard(nb, arr.num * 8, (void*)clone);
+        if (!ok) { sehEngineFree(nb); return 0; }
+        if (!writePtrGuard(root, arrOff, nb)) { sehEngineFree(nb); return 0; }
+        if (!writeIntGuard(root, arrOff + 8, arr.num + 1) ||
+            !writeIntGuard(root, arrOff + 12, newMax))
+        {
+            writeIntGuard(root, arrOff + 8, arr.num);
+            writeIntGuard(root, arrOff + 12, newMax);
+            return 0;
+        }
+        sehEngineFree(arr.data);
+        logf("append[r%d]: num %d->%d realloc  root=%s", ri, arr.num, arr.num + 1,
+             u8(root->GetFullName(nullptr)).c_str());
+        return 1;
     }
-    int newMax = arr.max + 4;
-    void* nb = nullptr;
-    if (sehEngineMalloc((unsigned long long)newMax * 8, &nb) != 0 || !nb)
+    return 0;
+}
+
+// v0.50e: 라이브 DLayerTitleGame_C **전부**에 편입한다. 어느 인스턴스가 진짜
+// 순회 주체인지 특정 불가(후보 2개, 바인딩 전부 null 실측) -- 전부 커버가 답.
+static bool tryAdoptClone(UObject* clone, UObject* liveExit)
+{
+    if (!ensureRoot()) return false;      // g_rootArrOff(클래스 오프셋)·계측용 g_root 확보
+    if (g_rootArrOff < 0) return false;
+    std::vector<UObject*> roots;
+    UOG::FindAllOf(L"DLayerTitleGame_C", roots);
+    bool any = false;
+    int ri = 0;
+    for (UObject* r : roots)
     {
-        logf("FAIL append: FMemory::Malloc 실패");
-        return false;
+        if (!r) continue;
+        std::wstring full = r->GetFullName(nullptr);
+        if (wcontains(full, L"Default__")) continue;
+        if (adoptIntoRoot(r, g_rootArrOff, clone, liveExit, ri) == 1) any = true;
+        ++ri;
     }
-    bool ok = true;
-    for (int jj = 0; jj < arr.num && ok; ++jj)
+    return any;
+}
+
+// v0.50e: 상시 감시용 -- 클론이 어느 라이브 뿌리의 배열에든 들어 있는가 (무로그).
+static bool cloneInAnyRootArray(UObject* clone)
+{
+    if (g_rootArrOff < 0) return false;
+    std::vector<UObject*> roots;
+    UOG::FindAllOf(L"DLayerTitleGame_C", roots);
+    for (UObject* r : roots)
     {
-        void* e = nullptr;
-        ok = readPtrGuard(arr.data, jj * 8, &e) && writePtrGuard(nb, jj * 8, e);
+        if (!r) continue;
+        std::wstring full = r->GetFullName(nullptr);
+        if (wcontains(full, L"Default__")) continue;
+        struct { void* data; int num; int max; } a{};
+        if (!readBytesGuard(r, g_rootArrOff, &a, 16)) continue;
+        if (!a.data || a.num <= 0 || a.num > 16) continue;
+        for (int jj = 0; jj < a.num; ++jj)
+        {
+            void* e = nullptr;
+            if (readPtrGuard(a.data, jj * 8, &e) && e == (void*)clone) return true;
+        }
     }
-    if (ok) ok = writePtrGuard(nb, arr.num * 8, (void*)clone);
-    if (!ok)
-    {
-        sehEngineFree(nb);
-        logf("FAIL append: 새 버퍼 채우기 AV");
-        return false;
-    }
-    if (!writePtrGuard(g_root, g_rootArrOff, nb))
-    {   // 헤더 미변경 -- 새 버퍼만 회수하면 무손상
-        sehEngineFree(nb);
-        logf("FAIL append: Data 쓰기 AV");
-        return false;
-    }
-    if (!writeIntGuard(g_root, g_rootArrOff + 8, arr.num + 1) ||
-        !writeIntGuard(g_root, g_rootArrOff + 12, newMax))
-    {   // Data 는 새 버퍼 -- Num/Max 를 구값·실크기로 되돌려 정합시키고 포기
-        // (클론 원소는 Num 밖이라 게임이 못 본다. 구버퍼는 해제 위험 -> 누수 감수)
-        writeIntGuard(g_root, g_rootArrOff + 8, arr.num);
-        writeIntGuard(g_root, g_rootArrOff + 12, newMax);
-        logf("FAIL append: 헤더 갱신 AV -- Num 롤백");
-        return false;
-    }
-    sehEngineFree(arr.data);   // 구버퍼도 게임 GMalloc 산(産) -- 같은 경로로 해제
-    ArrHdr chk{};
-    readBytesGuard(g_root, g_rootArrOff, &chk, 16);
-    bool verify = (chk.data == nb && chk.num == arr.num + 1 && chk.max == newMax);
-    logf("append: num %d->%d realloc=1 verify=%d", arr.num, chk.num, (int)verify);
-    return verify;
+    return false;
 }
 
 // 편입 성공 시 클론을 수직박스 맨 아래로 -- 배열 순서 [..., Exit, 클론] 과 화면
@@ -8415,6 +10124,7 @@ static void tryInject()
         g_siblings.push_back((void*)clone);
         // v0.40 9차: 게임 항목 배열 편입. 성공하면 시각 순서도 배열과 일치시키고,
         // 시각 재정렬이 실패하면 편입을 철회한다(순서 불일치 = 나가기 오발 위험).
+        if (g_adoptEnabled)
         {   // 10차: 배열이 비어 있으면(실측 num=0) 여기선 미편입으로 남고,
             // 폴링이 2초 주기로 재시도한다. 폴백 = 가상 정지(vstop).
             int ad = adoptAndAlign(clone, box, exitW);
@@ -8475,8 +10185,9 @@ static void addClonePadIcon(UObject* clone)
     UObject* bCls = findObj(L"/Script/UMG.Border", "padico");
     UObject* sCls = findObj(L"/Script/UMG.SizeBox", "padico");
     UObject* hCls = findObj(L"/Script/UMG.HorizontalBox", "padico");
+    UObject* oCls = findObj(L"/Script/UMG.Overlay", "padico");
     UObject* krl = findObj(L"/Script/Engine.Default__KismetRenderingLibrary", "padico");
-    if (!gs || !bCls || !sCls || !hCls) { logf("padico: 클래스 해석 실패 -- 생략"); return; }
+    if (!gs || !bCls || !sCls || !hCls || !oCls) { logf("padico: 클래스 해석 실패 -- 생략"); return; }
     UFunction* fnSpawn = fnOf(gs, L"SpawnObject", "padico");
     if (!fnSpawn || (int)fnSpawn->GetParmsSize() != 24) { logf("padico: SpawnObject 없음"); return; }
     auto spawn = [&](UObject* cls) -> UObject* {
@@ -8490,7 +10201,7 @@ static void addClonePadIcon(UObject* clone)
     };
     UObject* box = spawn(sCls);
     if (!box) { logf("padico: SizeBox spawn 실패 -- 생략"); return; }
-    float iw = 30.0f, ih = 30.0f;
+    float iw = 37.0f, ih = 37.0f;   // v0.50c: 46 -> 41 -> 37 (사용자 피드백 -10% x2)
     callBytes(box, L"SetWidthOverride", &iw, 4, "padico");
     callBytes(box, L"SetHeightOverride", &ih, 4, "padico");
     UObject* tex = nullptr;
@@ -8514,19 +10225,32 @@ static void addClonePadIcon(UObject* clone)
         setVisibility(im, 4, "padico");
         slotAlign(addChildTo(box, im, "padico"), 0, 0, "padico");
     }
-    // [글자][아이콘] HBox 를 만들어 Border content 로 되돌린다.
-    UObject* hbox = spawn(hCls);
-    if (!hbox) { logf("padico: HBox spawn 실패 -- 생략"); return; }
-    // 1) TitleText 를 HBox 로 옮긴다(AddChild 가 옛 부모 Border 에서 자동 분리).
-    slotAlign(addChildTo(hbox, tt, "padico"), -1, 2, "padico");       // 세로 중앙
-    // 2) 아이콘을 글자 바로 뒤에.
-    UObject* isl = addChildTo(hbox, box, "padico");
-    slotAlign(isl, -1, 2, "padico");
-    slotPad(isl, 10, 0, 0, 0, "padico");     // 글자와 아이콘 사이 10px
-    // 3) HBox 를 Border content 로 (Border 는 자동으로 가운데 정렬 -> 덩이째 중앙).
-    UObject* hsl = addChildTo(parent, hbox, "padico");
-    if (!hsl) { logf("padico: Border 에 HBox 부착 실패 -- 생략"); return; }
-    slotAlign(hsl, 2, 2, "padico");          // 가로/세로 중앙
+    // v0.50: Border content = Overlay. 글자는 중앙 그대로(움직이지 않음), 아이콘은
+    // "간격자(spacer)+아이콘" HBox 를 중앙에 얹어 글자 오른쪽으로 고정 오프셋만큼
+    // 민다(아이콘 중심 = 행중심 + 간격자폭/2). => 글자 위치 불변 + 아이콘 오른쪽 +
+    // 세로 중앙. HBox 를 그대로 중앙정렬하면 글자가 밀리므로(구현 v11b) 분리했다.
+    UObject* ov = spawn(oCls);
+    if (!ov) { logf("padico: Overlay spawn 실패 -- 생략"); return; }
+    slotAlign(addChildTo(ov, tt, "padico"), 2, 2, "padico");   // 글자: 중앙(불변)
+    UObject* ihb = spawn(hCls);
+    if (ihb)
+    {
+        if (UObject* sp = spawn(sCls))
+        {   // 간격자 -- 폭의 절반만큼 아이콘이 중앙에서 오른쪽으로. 라벨 폭이 언어마다
+            // 달라 언어별 상수(실측: EN "ModManager" 300 / KO "모드매니저" 240 = 여백 동일).
+            float spw = (g_lang == 1) ? 300.0f : 240.0f, sph = 1.0f;
+            callBytes(sp, L"SetWidthOverride", &spw, 4, "padico");
+            callBytes(sp, L"SetHeightOverride", &sph, 4, "padico");
+            setVisibility(sp, 4, "padico");
+            slotAlign(addChildTo(ihb, sp, "padico"), -1, 2, "padico");
+            g_padIconSpacer = (void*)sp;
+        }
+        slotAlign(addChildTo(ihb, box, "padico"), -1, 2, "padico");   // 아이콘: 세로중앙
+        slotAlign(addChildTo(ov, ihb, "padico"), 2, 2, "padico");      // 덩이: Overlay 중앙
+    }
+    UObject* osl = addChildTo(parent, ov, "padico");
+    if (!osl) { logf("padico: Border 에 Overlay 부착 실패 -- 생략"); return; }
+    slotAlign(osl, 2, 2, "padico");
     bool padOn = g_inputMode.load(std::memory_order_relaxed) == 1 &&
                  g_padPresent.load(std::memory_order_relaxed);
     setVisibility(box, padOn ? 4 : 1, "padico");
@@ -8590,36 +10314,12 @@ static bool finishClone(UObject* box, UObject* exitW, UObject* sample, UObject* 
         logf("%s AddChild(clone): slot=%p", slot ? "OK" : "WARN", slot);
         if (!slot) return false;  // 붙지 않았으면 이후 단계 무의미
     }
-    {
-        UFunction* fnRm = fnOf(box, L"RemoveChild", "removeChild");
-        bool removed = false;
-        if (fnRm)
-        {
-            int ps = (int)fnRm->GetParmsSize();
-            int ro = (int)fnRm->GetReturnValueOffset();
-            if (ps > 8 && ps <= 64 && ro >= 8 && ro < 64)
-            {
-                PB pb;
-                memcpy(pb.b, &exitW, 8);
-                if (peGuard(box, fnRm, pb.b)) removed = pb.b[ro] != 0;
-                else { logf("FAIL RemoveChild: SEH 예외"); g_hardFail = true; return false; }
-            }
-            else logf("WARN RemoveChild: parms=%d retOff=%d -- 재정렬 생략", ps, ro);
-        }
-        if (removed)
-        {
-            PB pb;
-            memcpy(pb.b, &exitW, 8);
-            if (!peGuard(box, fnAdd, pb.b))
-            {
-                logf("FAIL AddChild(exit 재부착): SEH 예외");
-                g_hardFail = true;
-                return false;
-            }
-            logf("OK 재정렬: 클론이 Exit 위로");
-        }
-        else logf("WARN 재정렬 실패 -- 클론이 맨 아래(Exit 뒤)에 남음 (Lua 도 동일 허용)");
-    }
+    // v0.50: 위치 원복 예약 -- 지금은 클론이 맨 아래(AddChild 결과). 키퍼가 게임의
+    // Exit 로컬라이즈가 안정된 뒤 재정렬(Exit 를 클론 아래로 내려 클론을 설정<->나가기
+    // 사이에 놓음)하고, 그 순간의 Exit 라벨을 캡처해 복원한다(언어 라벨 보호).
+    g_reorderPending = true;
+    g_reorderHaveLast = false;
+    g_reorderStableSince = 0;
 
     // 10) 라벨 2차 (Construct 가 라벨을 되돌렸을 수 있음)
     setLabel(clone, "post");
@@ -8657,6 +10357,13 @@ static bool finishClone(UObject* box, UObject* exitW, UObject* sample, UObject* 
     setVisibility(clone, 0, "hitTest");
 
     addClonePadIcon(clone);   // 11b: 패드 Y 아이콘(전용 진입 버튼 힌트)
+
+    // v0.50: 정렬 전 은신 -- 지금 클론은 맨 아래(AddChild 결과)다. 재정렬이 끝날
+    // 때까지 Collapsed 로 숨겨 "맨 아래에 나타났다가 1초 뒤 위로 점프"를 없앤다.
+    // 복귀(Visible 0)는 키퍼의 재정렬 블록이 모든 경로(성공/실패/시간초과)에서 보장.
+    setVisibility(clone, 1, "reorderHide");
+    g_reorderOpenTicks = 0;
+    blackboxPhase("title");   // v0.50: 블랙박스 -- 타이틀 도달 = 모드 시작 전부 완료
     return true;
 }
 
@@ -8699,6 +10406,11 @@ static void onProcessEventPre(UObject* context, UFunction* function, void* parms
         g_selEvtOn.store(*(unsigned char*)parms, std::memory_order_relaxed);
         g_selEvtItem.store((void*)context, std::memory_order_relaxed);
     }
+    // v0.50b: 클론 확정(패드 A/마우스 클릭 -- 게임이 부르는 OnClickedButton) 편승.
+    // 선택 시각이 OverlaySelected 가 아니어도(포커스 스타일) A 진입이 성립한다.
+    if (context && function == reinterpret_cast<UFunction*>(g_fnItemClicked.load(std::memory_order_relaxed)) &&
+        context == reinterpret_cast<UObject*>(g_myClone.load(std::memory_order_relaxed)))
+        g_cloneClickedMs.store(GetTickCount64(), std::memory_order_relaxed);
 
     // 콜백 밖으로는 어떤 C++ 예외도 내보내지 않는다 (14:19 크래시 교훈:
     // 엔진/UE4SS 경계를 넘는 예외 = terminate).
@@ -8753,6 +10465,8 @@ static void onProcessEventPre(UObject* context, UFunction* function, void* parms
                 g_fnFocusRecv.store((void*)function, std::memory_order_relaxed);
             if (wcontains(full, L"UserWidget:OnKeyDown"))
                 g_fnKeyDown.store((void*)function, std::memory_order_relaxed);
+            if (wcontains(full, L"DTitleMenuUserWidget:OnClickedButton"))
+                g_fnItemClicked.store((void*)function, std::memory_order_relaxed);
             static int s_menuFnBudget = 90;
             if (s_menuFnBudget > 0 &&
                 (wcontains(full, L"TitleMenu") || wcontains(full, L"Navigat") ||
@@ -8836,10 +10550,21 @@ class DsCppModManager final : public RC::CppUserModBase
     DsCppModManager()
     {
         ModName = L"DsCppModManager";
-        ModVersion = L"0.40";
+        ModVersion = L"0.50";
         ModDescription = L"Mod manager: key-bind and color-picker option controls";
         ModAuthors = L"SummerSpring";
         logf("start_mod: ctor OK (%s)", u8(MOD_VER_W).c_str());
+        // v0.50: 블랙박스 회전 + 초입 안전장치 -- 엔진이 pak 을 열기 전에 파일
+        // 계층만 손본다. (순수 Win32 I/O 전용. UE API 는 이 시점에 절대 금지.)
+        try
+        {
+            blackboxRotate();
+            earlyBootGuard();
+        }
+        catch (...)
+        {
+            logf("WARN earlyGuard: C++ 예외 -- 건너뜀 (본조치는 첫 틱 bootGuard)");
+        }
     }
 
     ~DsCppModManager() override
@@ -8853,6 +10578,7 @@ class DsCppModManager final : public RC::CppUserModBase
     auto on_unreal_init() -> void override
     {
         logf("on_unreal_init");
+        blackboxPhase("engine-init");   // v0.50: 블랙박스
         RC::Unreal::Hook::RegisterProcessEventPreCallback(&onProcessEventPre);
         logf("ProcessEvent pre-callback 등록 완료 (구형 오버로드)");
     }
@@ -8872,6 +10598,16 @@ class DsCppModManager final : public RC::CppUserModBase
         DWORD fgPid = 0;
         if (fgWnd) GetWindowThreadProcessId(fgWnd, &fgPid);
         const bool fgOurs = (fgPid == GetCurrentProcessId());
+        // v0.50: 입력 진단 기록 (스팀 컨트롤러 조사). 타이틀 = 클론 생존 신호.
+        // ⚠ 리뷰 D2: 진단 호출은 **클릭/ESC 래치 뒤**에 둔다 -- 진단이 파일·장치
+        // 열거로 잠깐 멎으면 그 사이의 짧은 클릭이 통째로 유실된다(래치는 틱당 1샘플).
+        // ⚠ 리뷰 확정 #2: 포인터만 보면 **고착**한다 -- 펌프가 SEH 로 죽으면
+        // (g_hardFail) cloneLost 에 영영 못 가서 g_myClone 이 non-null 로 남고,
+        // 그때부터 '타이틀'로 오인해 **실제 게임플레이 중에도** 기록하게 된다.
+        // 생존 신호(g_lastTitleMs, 자체가 hardFail 게이트 안이라 실패 시 멎는다)로
+        // 신선도를 함께 본다 -- 닫히는 쪽으로 실패한다.
+        const bool atTitle = g_myClone.load(std::memory_order_relaxed) != nullptr &&
+                             GetTickCount64() - g_lastTitleMs.load(std::memory_order_relaxed) < 2000;
         bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
         if (fgOurs)
         {
@@ -8913,6 +10649,7 @@ class DsCppModManager final : public RC::CppUserModBase
             g_inputMode.store(0, std::memory_order_relaxed);   // v0.40: 키보드 사용
         }
         m_escPrev = esc;
+        inputDiagTick(fgOurs, atTitle);   // 리뷰 D2: 래치를 다 세운 뒤에 진단(순수 관찰)
         // v0.40: 마우스가 3px 만 움직여도 키/마 모드 -- 게임 설정창 실측(패드 UI 즉시 숨김)
         {
             static POINT s_lastCur = {-100000, -100000};
@@ -8941,18 +10678,124 @@ class DsCppModManager final : public RC::CppUserModBase
             XINPUT_STATE xs;
             memset(&xs, 0, sizeof(xs));
             bool got = false;
+            // v0.50: 보조 XInput -- 기본(XINPUT1_4)이 못 보면 **게임이 쓰는 DLL**
+            // (XINPUT1_3 등, 이미 로드된 것)로도 물어본다. s_padAlt 가 그 슬롯을 기억한다.
+            static bool s_padAlt = false;
             if (s_padSlot >= 0)
             {
-                if (XInputGetState((DWORD)s_padSlot, &xs) == ERROR_SUCCESS) got = true;
-                else { s_padSlot = -1; s_nextScanMs = pnow + 3000; }
+                DWORD r = s_padAlt ? xiAltGetState((DWORD)s_padSlot, &xs)
+                                   : XInputGetState((DWORD)s_padSlot, &xs);
+                if (r == ERROR_SUCCESS) got = true;
+                else { s_padSlot = -1; s_padAlt = false; s_nextScanMs = pnow + 3000; }
             }
             else if (pnow >= s_nextScanMs)
             {
-                for (int gi = 0; gi < 4 && !got; ++gi)
-                    if (XInputGetState((DWORD)gi, &xs) == ERROR_SUCCESS) { s_padSlot = gi; got = true; }
+                /* ★ 조사 확정(2026-08-17, Valve 문서): Windows 에서 스팀 컨트롤러는
+                   **진짜 XInput 장치가 아니다**. 스팀 오버레이가 **게임 프로세스 안에서**
+                   XInput 함수 본체에 훅을 걸어 가짜 Xbox 패드를 만들어 낸다. 즉
+                   시스템 드라이버가 아니라 "어느 DLL 로 물어보느냐"가 보이냐 마느냐를
+                   가른다. 게임이 쓰는 DLL(XINPUT1_3)은 오버레이 초기화 시점에 이미
+                   올라와 있어 훅이 확실하고, 우리가 정적 링크로 늦게 들여오는
+                   XINPUT1_4 는 훅을 놓쳤을 수 있다. → **게임이 쓰는 쪽부터** 물어본다. */
+                xiAltResolve();
+                for (int pass = 0; pass < 2 && !got; ++pass)
+                {
+                    bool useAlt = (pass == 0) ? (g_xiAlt != nullptr) : false;
+                    if (pass == 1 && g_xiAlt == nullptr && s_padSlot >= 0) break;
+                    for (int gi = 0; gi < 4 && !got; ++gi)
+                    {
+                        DWORD r = useAlt ? xiAltGetState((DWORD)gi, &xs)
+                                         : XInputGetState((DWORD)gi, &xs);
+                        if (r != ERROR_SUCCESS) continue;
+                        s_padSlot = gi;
+                        s_padAlt = useAlt;
+                        got = true;
+                        static bool s_padWhereLogged = false;
+                        if (!s_padWhereLogged)
+                        {
+                            s_padWhereLogged = true;
+                            const char* who = useAlt
+                                ? (g_xiAltName ? u8(g_xiAltName).c_str() : "보조 XInput")
+                                : "XINPUT1_4(기본)";
+                            logf("pad: 슬롯 %d 인식 -- %s 경유", gi, who);
+                            inputLog("XInput: 슬롯 %d 인식 -- %s 경유%s", gi, who,
+                                     useAlt ? " (게임이 쓰는 DLL. 스팀 입력 에뮬 패드는 "
+                                              "이쪽에만 붙는 경우가 있다)" : "");
+                        }
+                    }
+                }
                 if (!got) s_nextScanMs = pnow + 3000;
             }
             g_padPresent.store(got, std::memory_order_relaxed);
+            // v0.50: 입력 진단 -- 타이틀에서만. 연결 상태·장치 능력(가상패드 식별)·
+            // 버튼/스틱 변화·패킷 번호(장치가 살아 있는지)를 남긴다.
+            if (atTitle && !g_inLogOff)
+            {
+                static int s_diagSlot = -2;      // -2 = 아직 안 봄 (첫 상태도 남긴다)
+                static ULONGLONG s_diagNextMs = 0;
+                static DWORD s_diagPacket = 0;
+                static WORD s_diagBtn = 0;
+                int nowSlot = got ? s_padSlot : -1;
+                if (nowSlot != s_diagSlot)
+                {
+                    s_diagSlot = nowSlot;
+                    if (got)
+                    {
+                        inputLog("XInput: 패드 인식됨 (슬롯 %d, %s)", s_padSlot,
+                                 s_padAlt ? (g_xiAltName ? u8(g_xiAltName).c_str() : "보조") : "기본 1_4");
+                        // ⚠ 리뷰: 보조(1_3) 슬롯인데 기본(1_4)의 GetCapabilities 를
+                        // 부르면 **항상 실패**한다 -- 같은 DLL 로 물어야 한다.
+                        // 보조 경로에선 능력 조회를 건너뛴다(연결 판정은 GetState 가 한다).
+                        if (!s_padAlt)
+                        {
+                            XINPUT_CAPABILITIES caps;
+                            memset(&caps, 0, sizeof(caps));
+                            if (XInputGetCapabilities((DWORD)s_padSlot, XINPUT_FLAG_GAMEPAD, &caps) == ERROR_SUCCESS)
+                                inputLog("XInput: 장치 능력 type=%u subtype=%u flags=0x%04X",
+                                         (unsigned)caps.Type, (unsigned)caps.SubType, (unsigned)caps.Flags);
+                            else
+                                inputLog("XInput: 장치 능력 조회 실패");
+                        }
+                    }
+                    else
+                    {
+                        inputLog("XInput: 인식된 패드 없음 (슬롯 0~3 전부 미연결)");
+                        inputLogJoysticks();   // XInput 밖에 장치가 있는지 (이름까지)
+                    }
+                    s_diagNextMs = pnow + 10000;
+                }
+                if (got)
+                {
+                    WORD nb = xs.Gamepad.wButtons;
+                    if (nb != s_diagBtn)
+                    {
+                        s_diagBtn = nb;
+                        inputLog("패드 버튼=0x%04X LX=%d LY=%d RX=%d RY=%d LT=%u RT=%u",
+                                 (unsigned)nb, (int)xs.Gamepad.sThumbLX, (int)xs.Gamepad.sThumbLY,
+                                 (int)xs.Gamepad.sThumbRX, (int)xs.Gamepad.sThumbRY,
+                                 (unsigned)xs.Gamepad.bLeftTrigger, (unsigned)xs.Gamepad.bRightTrigger);
+                    }
+                    if (pnow >= s_diagNextMs)
+                    {
+                        s_diagNextMs = pnow + 10000;
+                        inputLog("패드 요약: 슬롯=%d 패킷=%lu(직전 %lu) 버튼=0x%04X 전경=%d",
+                                 s_padSlot, (unsigned long)xs.dwPacketNumber,
+                                 (unsigned long)s_diagPacket, (unsigned)xs.Gamepad.wButtons,
+                                 (int)fgOurs);
+                        s_diagPacket = xs.dwPacketNumber;
+                    }
+                }
+                else if (pnow >= s_diagNextMs)
+                {
+                    s_diagNextMs = pnow + 30000;
+                    inputLog("패드 없음 상태 유지 -- 스팀 컨트롤러라면 스팀의 컨트롤러 설정이 "
+                             "Xbox(XInput) 형식으로 넘겨주지 않는 구성일 수 있다");
+                    // 리뷰 D2: 장치 열거는 블로킹이다 -- 장치 목록은 30초마다 바뀌는
+                    // 값이 아니니 세션당 3회로 막는다 (같은 줄이 반복될 뿐이다).
+                    static int s_joyScans = 0;
+                    if (s_joyScans < 3) { ++s_joyScans; inputLogJoysticks(); }
+                }
+            }
             if (got)
             {
                 WORD b = xs.Gamepad.wButtons;
@@ -9037,8 +10880,15 @@ class DsCppModManager final : public RC::CppUserModBase
             // v0.23: 부팅 안전장치 -- 게임 패치/직전 크래시를 감지해 모드를 내린다.
             // reconcile 보다 **먼저** 한다: 안전모드가 끈 상태를 그대로 계약에 반영해야
             // 한다(순서가 뒤바뀌면 방금 끈 것을 다시 켠 값으로 덮어쓴다).
+            // 리뷰 D6: 로그 파일 이름을 **세션 시작 날짜**로 확정한다. 지연 초기화에
+            // 맡기면 첫 기록(타이틀 진입)이 10~18초 뒤라 자정 직전 실행에서 날짜가
+            // 하루 밀린다. (g_inLogInit 가드라 두 번 열려도 무해)
+            inputLogOpen();
             bootGuard();
             reconcileRuntimeContract("게임 시작");
+            // v0.50: 켜짐인데 진입점(정션)이 없는 모드를 복구 -- 안전모드가 끈 것을
+            // 되살리지 않도록 반드시 bootGuard 뒤에 둔다.
+            reconcileEntryPoints("게임 시작");
         }
         ULONGLONG now = GetTickCount64();
         // v0.22: plugins 에 넣어 둔 zip 을 풀어 준다. 이 스레드(UpdateThread)에서만 --
@@ -9050,6 +10900,7 @@ class DsCppModManager final : public RC::CppUserModBase
             extractPluginZips();
             wrapLoosePaks();   // v0.40: 낱개 pak 파일 감싸기 (같은 3초 스윕)
         }
+        blackboxTick(now);   // v0.50: 블랙박스 -- 모드 시작 브래킷 + 로그 꼬리 스냅샷(5초)
         if (now - m_lastBeat >= 60000)
         {
             m_lastBeat = now;

@@ -148,6 +148,24 @@ README_BUNDLED = f"""DsCppModManager v{VERSION} — DragonSword: Awakening 용 C
   게임 안에서 [모드매니저 → 플러그인 → 폴더 바로가기] 로 열 수 있고,
   넣은 모드는 패널을 다시 열면 "모드선택" 에 표시됩니다.
 
+■ 이 모드가 남기는 기록 (전부 게임 폴더 안에만, 밖으로 보내지 않습니다)
+  Mods\\DsCppModManager\\dlls\\cppmm_log.txt   — 동작 기록
+  Mods\\DsCppModManager\\blackbox*.txt         — 크래시가 어느 단계에서 났는지
+  Mods\\DsCppModManager\\inputlog\\날짜.log     — 입력 진단 기록 (아래)
+
+  입력 진단 기록은 "컨트롤러를 인식 못 한다" 같은 문제의 원인을 가리기 위한
+  것으로, **타이틀 화면에 있을 때만** 남깁니다 (연결된 컨트롤러의 종류와 이름,
+  누른 패드 버튼과 스틱 값). 게임 플레이 중에는 남기지 않고, 인터넷으로
+  전송하지 않습니다.
+
+  키보드는 **어떤 키를 눌렀는지 남기지 않습니다** -- "1초 동안 키 입력 N회"
+  라는 횟수만 적습니다 (컨트롤러가 키보드로 전달되는지 판별하는 용도).
+  ※ 타이틀에서 스팀 오버레이(Shift+Tab)를 열어 타자를 치면 그 횟수도 함께
+    집계됩니다. 무엇을 쳤는지는 기록되지 않습니다.
+
+  전부 남기지 않으려면 Mods 폴더의 DsCppModManager 안에 inputlog_off.txt 를
+  만드세요 (다음 게임 실행부터 적용).
+
 ■ 문서
   MANUAL.md       — 사용 설명서 (화면 구성 · 조작 · 파일 위치 · 문제 해결)
   CHANGELOG.md    — 버전별 변경 내역
@@ -200,6 +218,24 @@ README_UNBUNDLED = f"""DsCppModManager v{VERSION} — DragonSword: Awakening 용
   Mods\\DsCppModManager\\plugins\\<모드이름>\\
     ├─ Scripts\\main.lua   (Lua 모드)  또는
     └─ dlls\\main.dll      (C++ 모드)
+
+■ 이 모드가 남기는 기록 (전부 게임 폴더 안에만, 밖으로 보내지 않습니다)
+  Mods\\DsCppModManager\\dlls\\cppmm_log.txt   — 동작 기록
+  Mods\\DsCppModManager\\blackbox*.txt         — 크래시가 어느 단계에서 났는지
+  Mods\\DsCppModManager\\inputlog\\날짜.log     — 입력 진단 기록 (아래)
+
+  입력 진단 기록은 "컨트롤러를 인식 못 한다" 같은 문제의 원인을 가리기 위한
+  것으로, **타이틀 화면에 있을 때만** 남깁니다 (연결된 컨트롤러의 종류와 이름,
+  누른 패드 버튼과 스틱 값). 게임 플레이 중에는 남기지 않고, 인터넷으로
+  전송하지 않습니다.
+
+  키보드는 **어떤 키를 눌렀는지 남기지 않습니다** -- "1초 동안 키 입력 N회"
+  라는 횟수만 적습니다 (컨트롤러가 키보드로 전달되는지 판별하는 용도).
+  ※ 타이틀에서 스팀 오버레이(Shift+Tab)를 열어 타자를 치면 그 횟수도 함께
+    집계됩니다. 무엇을 쳤는지는 기록되지 않습니다.
+
+  전부 남기지 않으려면 Mods 폴더의 DsCppModManager 안에 inputlog_off.txt 를
+  만드세요 (다음 게임 실행부터 적용).
 
 ■ 문서
   MANUAL.md       — 사용 설명서
