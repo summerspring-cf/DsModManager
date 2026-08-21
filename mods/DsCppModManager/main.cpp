@@ -331,7 +331,10 @@ static const wchar_t* trLabel() { return TR(L"모드매니저", L"ModManager"); 
 static void* g_langHs = nullptr;   // v0.40: [기본] 언어 콤보 알약 (히트 대상)
 static void* g_langTx = nullptr;
 static wchar_t g_langChoices[2][24] = {L"한국어(Korean)", L"English"};
-static const wchar_t* const MOD_VER_W = L"v0.50";
+// v0.51: 실수 옵션의 조절 단위 콤보 (값 칸 클릭은 "누를 수 있다"는 표시가 없어 폐기 --
+// 사용자 피드백. ◀ 왼쪽에 '단위' 라벨 + 콤보박스로 보여준다)
+static wchar_t g_unitChoices[2][24] = {L"±0.1", L"±0.01"};
+static const wchar_t* const MOD_VER_W = L"v0.51";
 static void* g_padIcon = nullptr;     // 11b: 클론 항목의 패드 Y 아이콘 위젯(SizeBox).
                                       // 패드 사용 중에만 보인다(키퍼가 가시성 토글).
 static void* g_popupPadIcon = nullptr;  // v0.50: 팝업 확인버튼 (A) 아이콘 (패드 시만)
@@ -1922,6 +1925,63 @@ static bool parseInt32Exact(const std::string& v, int* out)
     return true;
 }
 
+/* v0.51: 실수(고정소수 ×100) -- "0.5" "1.0" "0.25" 같은 값도 스테퍼로 조절
+   (사용자 피드백: "실수는 조절 버튼이 안 생긴다"). int 하나(o.val)에 100배로
+   담는다. 소수 1~2자리 표준형만 편집 대상 -- 그 밖(0.125, 1e-3, .5)은 종전대로
+   읽기 전용(표시만). o.parentValue 에 원본 소수 자릿수를 보관해(ini 행은 부모가
+   없어 이 칸이 논다) 저장 때 "1.50" 이 "1.5" 로 바뀌는 일이 없게 한다. */
+static bool parseFix100Exact(const std::string& v, int* out, int* fracOut)
+{
+    size_t i = 0;
+    bool neg = false;
+    if (i < v.size() && (v[i] == '+' || v[i] == '-'))
+    {
+        if (v[i] == '+') return false;   // 선행 + 는 비표준 -- 건드리지 않는다
+        neg = true;
+        ++i;
+    }
+    size_t dot = v.find('.');
+    if (dot == std::string::npos || dot <= i || dot + 1 >= v.size()) return false;
+    size_t frac = v.size() - dot - 1;
+    if (frac < 1 || frac > 2) return false;
+    for (size_t k = i; k < v.size(); ++k)
+    {
+        if (k == dot) continue;
+        if (v[k] < '0' || v[k] > '9') return false;
+    }
+    if (dot - i > 1 && v[i] == '0') return false;   // "01.5" 같은 앞자리 0 = 비표준
+    // 리뷰(v0.60): 정수부 6자리 상한 -- 파서가 클램프(±1,000,000.00)보다 넓으면
+    // 큰 값이 첫 클릭의 클램프로 반토막 나 저장된다. 범위 밖은 읽기 전용으로 남긴다.
+    if (dot - i > 6) return false;                  // 정수부 상한 (±999,999.99)
+    long long ip = _strtoi64(v.substr(i, dot - i).c_str(), nullptr, 10);
+    int fr = atoi(v.substr(dot + 1).c_str());
+    if (frac == 1) fr *= 10;
+    long long scaled = ip * 100 + fr;
+    if (neg) scaled = -scaled;
+    *out = (int)scaled;
+    if (fracOut) *fracOut = (int)frac;
+    return true;
+}
+
+// ×100 값 -> 문자열. minFrac=2 면 항상 두 자리("1.50"), 아니면 필요할 때만 두 자리.
+static void fix100ToA(int v, int minFrac, char* out, int cap)
+{
+    int a = v < 0 ? -v : v;
+    int ip = a / 100, fr = a % 100;
+    if (minFrac >= 2 || (fr % 10) != 0)
+        snprintf(out, cap, "%s%d.%02d", v < 0 ? "-" : "", ip, fr);
+    else
+        snprintf(out, cap, "%s%d.%d", v < 0 ? "-" : "", ip, fr / 10);
+}
+
+// UI 용: 값 숫자만 ("1.5"). 조절 단위는 별도 '단위' 콤보박스가 보여준다 (v0.51).
+static void fix100ToW(int v, int minFrac, wchar_t* out, int cap)
+{
+    char a[32];
+    fix100ToA(v, minFrac, a, 32);
+    utf8ToW(a, out, cap);
+}
+
 // config.ini 제자리 저장 -- 값 토막만 교체(키/주석/순서/나머지 보존). true=교체함.
 static bool iniReplaceValue(std::string& data, const char* section, const char* key, const std::string& newVal)
 {
@@ -1976,10 +2036,11 @@ static void saveIniBridge(PlgRow& r)
     {
         PlgOpt& o = r.opt[i];
         if (!o.iniBacked || o.iniHeader) continue;
-        if (o.type != 0 && o.type != 1) continue;   // 편집 가능한 것만(표시전용 제외)
+        if (o.type != 0 && o.type != 1 && o.type != 8) continue;   // 편집 가능한 것만(표시전용 제외)
         if (o.val == o.iniOrigVal) continue;         // v0.50: 사용자가 바꾼 키만 기록 -- 남의 줄 보존
-        char buf[24];
-        snprintf(buf, sizeof(buf), "%d", o.val);
+        char buf[32];
+        if (o.type == 8) fix100ToA(o.val, o.parentValue, buf, 32);   // v0.51: 실수는 원래 형식으로
+        else snprintf(buf, sizeof(buf), "%d", o.val);
         if (iniReplaceValue(body, o.iniSection, o.key, buf)) { ++changed; o.iniOrigVal = o.val; }
     }
     if (changed == 0) return;
@@ -2064,7 +2125,9 @@ static void loadIniBridge(PlgRow& r)
             o.iniOrigVal = o.val;
             utf8ToW(key, o.label, 48);
         }
-        else if (parseInt32Exact(val, &iv))   // v0.50: 왕복되는 표준 int32 만 편집 대상
+        // 리뷰(v0.60): 클램프(±100,000,000) 밖 정수는 편집 금지 -- 파서가 클램프보다
+        // 넓으면 첫 클릭의 클램프로 값이 뭉개져 저장된다. 범위 밖은 아래 읽기 전용으로.
+        else if (parseInt32Exact(val, &iv) && iv >= -100000000 && iv <= 100000000)
         {
             o.type = 1; o.val = iv; o.iniOrigVal = iv;
             int a = iv < 0 ? -iv : iv;
@@ -2074,10 +2137,23 @@ static void loadIniBridge(PlgRow& r)
         }
         else
         {
-            // 실수/문자열/비표준 정수(큰 수·앞0·부호) = 읽기 전용 표시 (라벨에 값 포함)
-            o.type = 7; o.iniHeader = false;
-            std::string lab = key + " = " + val;
-            utf8ToW(lab, o.label, 48);
+            int fv = 0, frac = 1;
+            if (parseFix100Exact(val, &fv, &frac))   // v0.51: 실수도 스테퍼로 (×100 고정소수)
+            {
+                o.type = 8; o.val = fv; o.iniOrigVal = fv;
+                o.parentValue = frac;                 // 원본 소수 자릿수 (저장 형식 보존)
+                // 기본 단위: 백분위가 실제로 쓰였으면 0.01, 아니면 0.1. 값 칸 클릭/A 로 전환.
+                o.step = ((fv < 0 ? -fv : fv) % 10 != 0) ? 1 : 10;
+                o.minV = -100000000; o.maxV = 100000000;      // ±1,000,000.00
+                utf8ToW(key, o.label, 48);
+            }
+            else
+            {
+                // 문자열/비표준 수(지수·소수 3자리+·앞0·부호) = 읽기 전용 표시 (라벨에 값 포함)
+                o.type = 7; o.iniHeader = false;
+                std::string lab = key + " = " + val;
+                utf8ToW(lab, o.label, 48);
+            }
         }
         ++realKeys;
         ++r.optN;
@@ -5513,13 +5589,14 @@ static bool openPanel(UObject* clone)
     // v0.28: showArrow=false 면 ▼ 를 빼고(키/색상은 목록이 아니다),
     //        oSwatch 를 주면 왼쪽에 색 견본 사각형을 단다.
     auto makeCombo = [&](UObject* hb, const wchar_t* curLabel, void** oHs, void** oTx,
-                         bool showArrow = true, void** oSwatch = nullptr) -> bool {
+                         bool showArrow = true, void** oSwatch = nullptr,
+                         float pillW = 675.0f) -> bool {   // v0.51: 폭 지정(단위 콤보는 좁게)
         if (!hb) return false;
         UObject* box = spawn(sCls, "panel.cbo");
         UObject* pill = box ? spawn(bCls, "panel.cboPill") : nullptr;
         UObject* hbx = pill ? spawn(hCls, "panel.cboRow") : nullptr;
         if (!box || !pill || !hbx) return false;
-        float fw = 675.0f, fh = 76.0f;
+        float fw = pillW, fh = 76.0f;
         callBytes(box, L"SetWidthOverride", &fw, 4, "panel.cbo");
         callBytes(box, L"SetHeightOverride", &fh, 4, "panel.cbo");
         setVisibility(box, 4, "panel.cbo");
@@ -6063,6 +6140,22 @@ static bool openPanel(UObject* clone)
                                         slotPad(s2, 8, 0, 0, 0, "panel.step");
                                         return bd;
                                     };
+                                    if (o.type == 8)
+                                    {   // v0.51: 조절 단위 = '단위' 라벨 + 콤보박스 (◀ 왼쪽).
+                                        // 값 칸 클릭 전환은 "누를 수 있다"는 표시가 없어 폐기(피드백).
+                                        if (UObject* ul = spawn(tCls, "panel.unitLbl"))
+                                        {
+                                            setVisibility(ul, 4, "panel.unitLbl");
+                                            setTextOn(ul, TR(L"조절 단위", L"Step"), "panel.unitLbl");
+                                            setTextColor(ul, {0.52f, 0.57f, 0.62f, 1.0f}, "panel.unitLbl");
+                                            applyFontScaled(ul, 0.8f);
+                                            UObject* us = addChildTo(hbO, ul, "panel.unitLbl");
+                                            slotAlign(us, -1, 2, "panel.unitLbl");
+                                            slotPad(us, 0, 0, 14, 0, "panel.unitLbl");
+                                        }
+                                        makeCombo(hbO, g_unitChoices[o.step == 1 ? 1 : 0],
+                                                  &o.comboHs, &o.comboTx, true, nullptr, 240.0f);
+                                    }
                                     o.hsDec = stepBtn(L"◀");
                                     if (UObject* vbox = spawn(sCls, "panel.stepVal"))
                                     {
@@ -6072,8 +6165,11 @@ static bool openPanel(UObject* clone)
                                         setVisibility(vbox, 4, "panel.stepVal");
                                         if (UObject* vt = spawn(tCls, "panel.stepVT"))
                                         {
-                                            wchar_t buf[16];
-                                            swprintf(buf, 16, L"%d", o.val);
+                                            wchar_t buf[48];
+                                            if (o.type == 8)
+                                                fix100ToW(o.val, o.parentValue, buf, 48);
+                                            else
+                                                swprintf(buf, 48, L"%d", o.val);
                                             setVisibility(vt, 4, "panel.stepVT");
                                             setTextOn(vt, buf, "panel.stepVT");
                                             setTextColor(vt, {0.97f, 0.97f, 0.98f, 1.0f}, "panel.stepVT");
@@ -7605,7 +7701,19 @@ static bool comboApplyIdx(int idx, UObject* clone)
         if (g_comboOpt >= 0 && g_comboOpt < r.optN)
         {
             PlgOpt& o = r.opt[g_comboOpt];
-            if (idx >= 0 && idx < o.choiceN && o.val != idx)
+            if (o.type == 8)
+            {   // v0.51: 실수 '단위' 콤보 -- 조절 폭만 바꾼다(저장 없음)
+                int ns = (idx == 1) ? 1 : 10;
+                if (ns != o.step)
+                {
+                    o.step = ns;
+                    if (g_comboValTx && idx >= 0 && idx < 2)
+                        setTextOn(reinterpret_cast<UObject*>(g_comboValTx), g_unitChoices[idx], "pad-unit");
+                    logf("combo(패드): '%s' %s 조절 단위 = %s", u8(r.name).c_str(), o.key,
+                         idx == 1 ? "0.01" : "0.1");
+                }
+            }
+            else if (idx >= 0 && idx < o.choiceN && o.val != idx)
             {
                 o.val = idx;
                 if (g_comboValTx)
@@ -7887,6 +7995,36 @@ static bool padPanelInput(unsigned pe, UObject* clone)
                 navAfterRebuild();
                 return true;
             }
+        }
+        return false;
+    }
+    if (o.type == 8)          // v0.51: 실수 스테퍼 -- 좌/우 = 조절, A = '단위' 콤보 열기
+    {
+        if (act)
+        {
+            int cur = (o.step == 1) ? 1 : 0;
+            if (openCombo(reinterpret_cast<UObject*>(o.comboHs), g_unitChoices, 2,
+                          cur, nv.row, nv.opt, o.comboTx))
+            {
+                g_comboPadSel = cur;
+                paintComboItem(cur, true);
+            }
+            return false;
+        }
+        if (!dir) return false;
+        int nv2 = o.val + dir * o.step;
+        if (nv2 < o.minV) nv2 = o.minV;
+        if (nv2 > o.maxV) nv2 = o.maxV;
+        if (nv2 != o.val)
+        {
+            o.val = nv2;
+            if (o.valText)
+            {
+                wchar_t vbuf[48];
+                fix100ToW(o.val, o.parentValue, vbuf, 48);
+                setTextOn(reinterpret_cast<UObject*>(o.valText), vbuf, "pad-fstep");
+            }
+            saveOptionValues(r);
         }
         return false;
     }
@@ -8451,7 +8589,20 @@ static void pump(ULONGLONG now)
                             if (g_comboOpt >= 0 && g_comboOpt < r.optN)
                             {
                                 PlgOpt& o = r.opt[g_comboOpt];
-                                if (hov < o.choiceN && o.val != hov)
+                                if (o.type == 8)
+                                {   // v0.51: 실수 '단위' 콤보 -- 값이 아니라 조절 폭만 바꾼다(저장 없음)
+                                    int ns = (hov == 1) ? 1 : 10;
+                                    if (ns != o.step)
+                                    {
+                                        o.step = ns;
+                                        if (g_comboValTx)
+                                            setTextOn(reinterpret_cast<UObject*>(g_comboValTx),
+                                                      g_unitChoices[hov], "combo-unit");
+                                        logf("combo: '%s' %s 조절 단위 = %s", u8(r.name).c_str(),
+                                             o.key, hov == 1 ? "0.01" : "0.1");
+                                    }
+                                }
+                                else if (hov < o.choiceN && o.val != hov)
                                 {
                                     o.val = hov;
                                     if (g_comboValTx)
@@ -8742,6 +8893,12 @@ static void pump(ULONGLONG now)
                             g_armKind = ARM_INC;
                             g_armHs = o.hsInc;
                         }
+                        else if (o.type == 8 && o.comboHs &&
+                                 isHovered(reinterpret_cast<UObject*>(o.comboHs), "opt-unit") == 1)
+                        {   // v0.51: 실수 '단위' 콤보 = 드롭다운으로 0.1/0.01 선택
+                            g_armKind = ARM_COMBO_OPEN;
+                            g_armHs = o.comboHs;
+                        }
                     }
                     if (g_armKind != ARM_NONE) { g_armRow = i; g_armOpt = oi; }
                 }
@@ -8839,8 +8996,12 @@ static void pump(ULONGLONG now)
                     }
                     else if (kind == ARM_COMBO_OPEN)
                     {
-                        openCombo(reinterpret_cast<UObject*>(o.comboHs), o.choices, o.choiceN,
-                                  (o.val >= 0 && o.val < o.choiceN) ? o.val : 0, row, oi, o.comboTx);
+                        if (o.type == 8)   // v0.51: 실수 '단위' 콤보 (±0.1 / ±0.01)
+                            openCombo(reinterpret_cast<UObject*>(o.comboHs), g_unitChoices, 2,
+                                      (o.step == 1) ? 1 : 0, row, oi, o.comboTx);
+                        else
+                            openCombo(reinterpret_cast<UObject*>(o.comboHs), o.choices, o.choiceN,
+                                      (o.val >= 0 && o.val < o.choiceN) ? o.val : 0, row, oi, o.comboTx);
                     }
                     else if (kind == ARM_CHECK)
                     {
@@ -8879,8 +9040,11 @@ static void pump(ULONGLONG now)
                             o.val = nv;
                             if (o.valText)
                             {
-                                wchar_t vbuf[16];
-                                swprintf(vbuf, 16, L"%d", o.val);
+                                wchar_t vbuf[48];
+                                if (o.type == 8)   // v0.51: 실수는 소수 표기
+                                    fix100ToW(o.val, o.parentValue, vbuf, 48);
+                                else
+                                    swprintf(vbuf, 48, L"%d", o.val);
                                 setTextOn(reinterpret_cast<UObject*>(o.valText), vbuf, "opt-val");
                             }
                             saveOptionValues(r);
@@ -10550,7 +10714,7 @@ class DsCppModManager final : public RC::CppUserModBase
     DsCppModManager()
     {
         ModName = L"DsCppModManager";
-        ModVersion = L"0.50";
+        ModVersion = L"0.51";
         ModDescription = L"Mod manager: key-bind and color-picker option controls";
         ModAuthors = L"SummerSpring";
         logf("start_mod: ctor OK (%s)", u8(MOD_VER_W).c_str());
