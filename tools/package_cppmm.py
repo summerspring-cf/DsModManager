@@ -448,6 +448,7 @@ def make_install_bat(bundled):
 def write_manager(z):
     """DsCppModManager/* (매니저 본체) — 두 배포본이 공유한다."""
     z.write(os.path.join(MOD, "main.dll"), "DsCppModManager/dlls/main.dll")
+    z.write(os.path.join(MOD, "recovery_watchdog.ps1"), "DsCppModManager/recovery_watchdog.ps1")
     assets = os.path.join(MOD, "Assets")
     for fn in sorted(os.listdir(assets)):
         if fn.lower().endswith(".png"):
@@ -473,10 +474,12 @@ def write_install_bat(z, bundled):
 def check_clean(zip_path, bundled):
     """배포본에 사용자 상태가 섞이지 않았는지 (PACKAGING.md 3·4항). 미동봉판은
     UE4SS/ 가 **없어야** 한다."""
-    forbidden_names = ("dsruntime.txt", "dsoptions.txt", "dsorder.txt", "version.txt")
+    forbidden_names = ("dsruntime.txt", "dsoptions.txt", "dsorder.txt", "version.txt", "bootstate.txt", "safemode_last.txt", "safemode_restore.txt")
     bad = []
     with zipfile.ZipFile(zip_path) as z:
         for name in z.namelist():
+            if name.lower().startswith("dscppmodmanager/autorecovery/"):
+                bad.append(f"복구 실행 상태 포함: {name}")
             if name.startswith("DsCppModManager/plugins/") and name.rstrip("/") != "DsCppModManager/plugins":
                 bad.append(f"plugins 안에 내용물: {name}")
             if os.path.basename(name).lower() in forbidden_names:

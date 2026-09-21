@@ -334,7 +334,7 @@ static wchar_t g_langChoices[2][24] = {L"한국어(Korean)", L"English"};
 // v0.51: 실수 옵션의 조절 단위 콤보 (값 칸 클릭은 "누를 수 있다"는 표시가 없어 폐기 --
 // 사용자 피드백. ◀ 왼쪽에 '단위' 라벨 + 콤보박스로 보여준다)
 static wchar_t g_unitChoices[2][24] = {L"±0.1", L"±0.01"};
-static const wchar_t* const MOD_VER_W = L"v0.51";
+static const wchar_t* const MOD_VER_W = L"v0.60";
 static void* g_padIcon = nullptr;     // 11b: 클론 항목의 패드 Y 아이콘 위젯(SizeBox).
                                       // 패드 사용 중에만 보인다(키퍼가 가시성 토글).
 static void* g_popupPadIcon = nullptr;  // v0.50: 팝업 확인버튼 (A) 아이콘 (패드 시만)
@@ -638,6 +638,14 @@ struct NavItem
 #define NAVK_OPT    3
 #define NAVK_FOLD   4
 #define NAVK_ORD    5
+#define NAVK_RESTORE 6
+#define NAVK_AUTO 7
+#define NAVK_AUTOHELP 8
+static void* g_autoHs = nullptr;
+static void* g_autoHelpHs = nullptr;
+static bool g_autoConfirm = false;
+static bool g_autoRefresh = false;
+static void* g_restoreHs = nullptr;
 static NavItem g_nav[600];
 static int g_navN = 0;
 static int g_navSel = -1;       // -1 = 패드 미사용 (테두리 없음)
@@ -697,7 +705,7 @@ static int g_activeTab = 0;                    // 0=모드 1=순서 (세션 동�
 static void* g_hsTab[2] = {nullptr, nullptr};  // 탭 셀 히트스팟
 struct OrderRow
 {
-    wchar_t name[64];   // 폴더명 (dsorder.txt 의 키) -- 내용물: 재배열 시 이동
+    wchar_t name[224];  // 종류+상대경로 (dsorder.txt 의 키) -- 내용물: 재배열 시 이동
     wchar_t label[64];  // 표시명 (없으면 폴더명 복사)
     void* band;         // 행 밴드 Border -- 슬롯: 위젯은 고정, 내용만 옮긴다
     void* text;         // 라벨 TextBlock
@@ -749,7 +757,7 @@ static bool g_dsActive = false;      // 임계값 초과 = 스크롤로 확정(=
 enum ArmKind
 {
     ARM_NONE = 0, ARM_MOD_OFF, ARM_MOD_ON, ARM_OPT_OFF, ARM_OPT_ON,
-    ARM_DEC, ARM_INC, ARM_COMBO_OPEN, ARM_FOLDER, ARM_FOLD, ARM_COMBO_ITEM,
+    ARM_DEC, ARM_INC, ARM_COMBO_OPEN, ARM_FOLDER, ARM_FOLD, ARM_COMBO_ITEM, ARM_RESTORE, ARM_AUTO, ARM_AUTOHELP,
     ARM_KEYBIND, ARM_COLOR_OPEN, ARM_CHECK, ARM_BUTTON, ARM_LANG
 };
 static int g_armKind = ARM_NONE;
@@ -2369,6 +2377,25 @@ struct PlgEnt
     bool pak;           // v0.27: .pak 을 담은 폴더 = 콘텐츠(pak) 모드
 };
 
+// Stable UI/recovery identity, independent of the loader's leaf name.
+static std::wstring pluginId(const wchar_t* name, const wchar_t* rel, bool pak)
+{
+    return std::wstring(pak ? L"pak|" : L"script|") + (rel && rel[0] ? rel : name);
+}
+
+static bool pluginEnabled(const wchar_t* name, const wchar_t* rel, bool pak)
+{
+    wchar_t p[MAX_PATH * 2];
+    pluginSrcPath(p, rel && rel[0] ? rel : name);
+    lstrcatW(p, L"\\enabled.txt");
+    if (pathExistsW(p)) return true;
+    if (pak) return false;
+    gameModsRoot(p);
+    lstrcatW(p, name);
+    lstrcatW(p, L"\\enabled.txt");
+    return pathExistsW(p) || modsTxtEnabled(name);
+}
+
 /* ======================= v0.27: pak 모드 =================================
   UE4SS 모드와 로드 경로가 완전히 다르다.
     UE4SS 모드 : Mods\<이름>\Scripts|dlls        -> UE4SS 가 로드
@@ -2627,11 +2654,12 @@ static void applySavedOrder(PlgEnt* e, int n)
         while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
         while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.erase(0, 1);
         if (line.empty()) continue;
-        wchar_t nameW[64];
-        utf8ToW(line, nameW, 64);
+        wchar_t nameW[224];
+        utf8ToW(line, nameW, 224);
         for (int i = outIdx; i < n; ++i)
         {
-            if (_wcsicmp(e[i].name, nameW) != 0) continue;
+            if (_wcsicmp(pluginId(e[i].name, e[i].rel, e[i].pak).c_str(), nameW) != 0 &&
+                (line.find('|') != std::string::npos || _wcsicmp(e[i].name, nameW) != 0)) continue;
             PlgEnt t = e[i];  // 안정 회전 -- 사이 항목들의 상대 순서 유지
             for (int j = i; j > outIdx; --j) e[j] = e[j - 1];
             e[outIdx++] = t;
@@ -2839,9 +2867,9 @@ static void scanPluginDir(const wchar_t* base, const wchar_t* rel, int depth,
             logf("panel: '%s' 는 목록 제외 대상(UE4SS 기본 모드/매니저 자신)", u8(fd.cFileName).c_str());
             continue;
         }
-        bool dup = false;  // 같은 이름이 여러 곳에 있으면 먼저 찾은 것만
+        bool dup = false;  // 같은 로더 영역의 이름 충돌만 제외 (pak과 Lua/C++는 독립)
         for (int i = 0; i < *n; ++i)
-            if (_wcsicmp(ents[i].name, fd.cFileName) == 0) { dup = true; break; }
+            if (ents[i].pak == pakMod && _wcsicmp(ents[i].name, fd.cFileName) == 0) { dup = true; break; }
         if (dup)
         {
             logf("panel: '%s' 중복 발견(%s) -- 건너뜀", u8(fd.cFileName).c_str(), u8(childRel).c_str());
@@ -2897,9 +2925,9 @@ static int collectPluginsCached(ULONGLONG now)
 }
 
 // dsruntime.txt: 범용 런타임 켬끔 신호 (서드파티용 -- 자기 폴더만 읽으면 됨)
-static void writeRuntimeFlag(const wchar_t* name, const wchar_t* rel, bool on)
+static void writeRuntimeFlag(const wchar_t* name, const wchar_t* rel, bool on, bool pak = false)
 {
-    for (int side = 0; side < 2; ++side)
+    for (int side = pak ? 1 : 0; side < 2; ++side)
     {
         wchar_t p[MAX_PATH * 2];
         if (side == 0)
@@ -3276,7 +3304,7 @@ static void applyPluginState(PlgRow& r)
         logf("plugin '%s': pak 모드 %s -- %s 에 파일 %d개 %s (게임 재시작 후 반영)",
              u8(r.name).c_str(), r.on ? "켬" : "끔", u8(sub).c_str(), nf,
              r.on ? "연결" : "해제");
-        writeRuntimeFlag(r.name, r.rel, r.on);
+        writeRuntimeFlag(r.name, r.rel, r.on, r.pak);
         return;
     }
     if (r.on)
@@ -3327,7 +3355,7 @@ static void applyPluginState(PlgRow& r)
         logf("plugin '%s': 런타임 키 %s=%d 동기화 (로드된 모드는 즉시 반영)",
              u8(r.name).c_str(), k, (int)r.on);
     }
-    writeRuntimeFlag(r.name, r.rel, r.on);
+    writeRuntimeFlag(r.name, r.rel, r.on, r.pak);
 }
 
 /* v0.50: 진입점 정합 — "켜짐인데 재시작해도 안 뜨는" 문제의 진짜 뿌리 (넥서스 리포트 1번)
@@ -3504,11 +3532,357 @@ static ULONGLONG bootStateGet(const std::string& data, const char* key)
     return _strtoui64(data.c_str() + p + k.size(), nullptr, 10);
 }
 
+
+// Recovery journal: save before safety shutdown; retain failed/missing entries.
+static std::atomic<bool> g_autoLease{false};
+static std::atomic<DWORD> g_autoStartingPid{0};
+static std::atomic<ULONGLONG> g_autoStartingUntil{0};
+// Recovery watchdog state is separate from all user option/config files.
+static std::wstring autoPath(const wchar_t* file)
+{
+    wchar_t root[MAX_PATH * 2]; modRootPath(root);
+    return std::wstring(root) + L"autorecovery\\" + file;
+}
+static std::string autoValue(const std::string& text, const char* key)
+{
+    std::string prefix = std::string(key) + "=";
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find('\n', pos); if (end == std::string::npos) end = text.size();
+        std::string line = text.substr(pos, end-pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.compare(0, prefix.size(), prefix) == 0) return line.substr(prefix.size());
+        pos = end + 1;
+    }
+    return {};
+}
+static bool autoWrite(const wchar_t* file, const std::string& data)
+{
+    auto p = autoPath(file), tmp = p + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD wr = 0;
+    bool ok = WriteFile(h, data.data(), (DWORD)data.size(), &wr, nullptr) && wr == data.size();
+    if (ok) ok = FlushFileBuffers(h) != 0;
+    CloseHandle(h);
+    if (ok) ok = MoveFileExW(tmp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    if (!ok) DeleteFileW(tmp.c_str());
+    return ok;
+}
+static bool autoActive()
+{
+    if (pathExistsW(autoPath(L"stop.txt").c_str()) || autoValue(readFileA(autoPath(L"settings.txt").c_str()),"enabled")=="0") return false;
+    if (g_autoStartingPid && GetTickCount64()<g_autoStartingUntil) {
+        HANDLE h=OpenProcess(SYNCHRONIZE,FALSE,g_autoStartingPid);
+        if(h) { bool alive=WaitForSingleObject(h,0)==WAIT_TIMEOUT; CloseHandle(h); if(alive) return true; }
+    }
+    auto state = readFileA(autoPath(L"status.txt").c_str());
+    auto phase = autoValue(state, "phase");
+    if (phase.empty() || phase == "paused" || phase == "complete") return false;
+    DWORD pid = (DWORD)strtoul(autoValue(state, "helper_pid").c_str(), nullptr, 10);
+    if (!pid) return false;
+    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    bool running = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+    // Never treat a recycled PID belonging to an unrelated process as our watchdog.
+    wchar_t path[MAX_PATH * 2]; DWORD cap = MAX_PATH * 2;
+    if (!QueryFullProcessImageNameW(h, 0, path, &cap)) running = false;
+    else {
+        const wchar_t* leaf = wcsrchr(path, L'\\');
+        if (!leaf || _wcsicmp(leaf + 1, L"powershell.exe") != 0) running = false;
+    }
+    CloseHandle(h);
+    return running;
+}
+static bool autoEnabled()
+{
+    return autoValue(readFileA(autoPath(L"settings.txt").c_str()),"enabled")=="1";
+}
+static bool autoOwnsBoot()
+{
+    if (!autoActive()) return false;
+    auto phase=autoValue(readFileA(autoPath(L"status.txt").c_str()),"phase");
+    return phase!="watching" && phase!="armed" && !phase.empty();
+}
+static bool autoSetEnabled(bool on)
+{
+    wchar_t root[MAX_PATH*2]; modRootPath(root);
+    CreateDirectoryW((std::wstring(root)+L"autorecovery").c_str(),nullptr);
+    if (!autoWrite(L"settings.txt",on ? "enabled=1\n" : "enabled=0\n")) return false;
+    if (!on) autoWrite(L"stop.txt","user-stop\n");
+    return true;
+}
+static std::string jsonString(const std::wstring& value)
+{
+    std::string out = "\"";
+    for (unsigned char c : u8(value)) {
+        if (c == '\\' || c == '"') { out += '\\'; out += (char)c; }
+        else if (c < 32) { char b[8]; snprintf(b, sizeof(b), "\\u%04x", c); out += b; }
+        else out += (char)c;
+    }
+    return out + "\"";
+}
+static void autoLoadSetChanged()
+{
+    if(autoActive() && !autoOwnsBoot()) autoWrite(L"stop.txt","load-set-changed-next-launch\n");
+}
+static const wchar_t* autoHelp()
+{
+    return TR(L"ON은 감시 예약입니다. 다음 게임 실행부터 감시합니다.\n정상 종료 시 아무 모드도 변경하지 않습니다.\n크래시가 확인되면 당시 켜져 있던 모드를 하나씩 추가해 검사합니다.\n게임 플레이 5분을 관찰한 뒤 정상 종료하고 다음 후보로 재실행합니다.\n검사 중 크래시가 나면 그 후보를 OFF로 두고 다음 후보를 검사합니다.\n반복 종료로 미저장 진행을 잃을 수 있습니다. 매번 직접 게임에 진입하세요.\n기존 옵션값은 유지됩니다. 5분 통과는 호환성 보장이 아닙니다.\nOFF 또는 Ctrl+Shift+F10으로 중단합니다. 충돌 의심은 원인 확정이 아닙니다.",
+              L"ON arms monitoring from the next game launch.\nNormal exits do not change mods.\nA confirmed crash starts checks of mods enabled in that run, one at a time.\nEach 5-minute gameplay check is followed by a normal exit and the next launch.\nA crash during a check keeps that suspect OFF and advances to the next candidate.\nRepeated exits may lose unsaved progress. Enter gameplay after each launch.\nExisting options are preserved. Passing 5 minutes does not prove compatibility.\nStop with OFF or Ctrl+Shift+F10. A suspect is not a proven cause.");
+}
+static bool autoStop()
+{
+    return autoSetEnabled(false);
+}
+
+// Only identities found by the plugin scanner can ever be restored.
+static void recoveryPath(wchar_t* p)
+{
+    modRootPath(p);
+    lstrcatW(p, L"safemode_restore.txt");
+}
+
+static std::vector<std::wstring> readRecovery()
+{
+    wchar_t p[MAX_PATH * 2];
+    recoveryPath(p);
+    if (!pathExistsW(p))
+    {
+        modRootPath(p);
+        lstrcatW(p, L"safemode_last.txt"); // legacy import, only until first journal write
+    }
+    std::string data = readFileA(p);
+    if (data.size() >= 3 && data.compare(0, 3, "\xEF\xBB\xBF") == 0) data.erase(0, 3);
+    std::vector<std::wstring> ids;
+    size_t pos = 0;
+    while (pos < data.size() && ids.size() < 1000)
+    {
+        size_t end = data.find('\n', pos);
+        if (end == std::string::npos) end = data.size();
+        std::string line = data.substr(pos, end - pos);
+        pos = end + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#' || line.size() > 1024) continue;
+        wchar_t id[224];
+        utf8ToW(line, id, 224);
+        if (u8(id) != line) continue; // reject truncated or invalid UTF-8 identities
+        bool duplicate = false;
+        for (const auto& old : ids) if (_wcsicmp(old.c_str(), id) == 0) duplicate = true;
+        if (!duplicate) ids.emplace_back(id);
+    }
+    return ids;
+}
+
+static bool saveRecovery(const std::vector<std::wstring>& ids)
+{
+    wchar_t p[MAX_PATH * 2], temp[MAX_PATH * 2];
+    recoveryPath(p);
+    swprintf(temp, MAX_PATH * 2, L"%s.tmp", p);
+    std::string out = "# DsCppModManager recovery v1\n";
+    for (const auto& id : ids) out += u8(id) + "\n";
+    HANDLE h = CreateFileW(temp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    bool ok = WriteFile(h, out.data(), (DWORD)out.size(), &written, nullptr) && written == out.size();
+    if (ok) ok = FlushFileBuffers(h) != 0;
+    CloseHandle(h);
+    if (ok) ok = MoveFileExW(temp, p, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    if (!ok) { DeleteFileW(temp); logf("FAIL recovery: journal write failed (%lu)", GetLastError()); }
+    return ok;
+}
+
+static int recoveryMatch(const std::wstring& id, const PlgEnt* ents, int n)
+{
+    int found = -1;
+    const bool legacy = id.find(L'|') == std::wstring::npos;
+    for (int i = 0; i < n; ++i)
+    {
+        const std::wstring key = legacy ? std::wstring(ents[i].name) : pluginId(ents[i].name, ents[i].rel, ents[i].pak);
+        if (_wcsicmp(id.c_str(), key.c_str()) != 0) continue;
+        if (found >= 0) return -1; // ambiguous legacy names must never activate both mods
+        found = i;
+    }
+    return found;
+}
+
+static void snapshotRecovery(const PlgEnt* ents, int n)
+{
+    auto ids = readRecovery();
+    for (auto& id : ids)
+    {
+        int i = recoveryMatch(id, ents, n);
+        if (i >= 0) id = pluginId(ents[i].name, ents[i].rel, ents[i].pak);
+    }
+    for (int i = 0; i < n; ++i)
+    {
+        if (!pluginEnabled(ents[i].name, ents[i].rel, ents[i].pak)) continue;
+        auto id = pluginId(ents[i].name, ents[i].rel, ents[i].pak);
+        bool exists = false;
+        for (const auto& old : ids) if (_wcsicmp(old.c_str(), id.c_str()) == 0) exists = true;
+        if (!exists) ids.push_back(id);
+    }
+    if (!saveRecovery(ids)) logf("WARN safety: disabling mods without a new recovery snapshot");
+}
+
+static bool restoredEntryReady(const PlgRow& r)
+{
+    if (!r.on || !pluginEnabled(r.name, r.rel, r.pak)) return false;
+    wchar_t src[MAX_PATH * 2], dst[MAX_PATH * 2];
+    pluginSrcPath(src, r.rel[0] ? r.rel : r.name);
+    if (!r.pak)
+    {
+        gameModsRoot(dst);
+        lstrcatW(dst, r.name);
+        const wchar_t* entries[] = {L"\\Scripts\\main.lua", L"\\dlls\\main.dll"};
+        for (const auto* entry : entries)
+        {
+            std::wstring a = std::wstring(src) + entry, b = std::wstring(dst) + entry;
+            if (pathExistsW(a.c_str()) && sameFileIdentity(a.c_str(), b.c_str())) return true;
+        }
+        return false;
+    }
+    contentPaksPath(dst, _stricmp(r.pakTarget, "logicmods") == 0 ? L"LogicMods" : L"~mods");
+    std::wstring pattern = std::wstring(src) + L"\\*";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool ok = true;
+    int files = 0;
+    do
+    {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !isPakFileName(fd.cFileName)) continue;
+        ++files;
+        std::wstring a = std::wstring(src) + L"\\" + fd.cFileName;
+        std::wstring b = std::wstring(dst) + fd.cFileName;
+        if (!sameFileIdentity(a.c_str(), b.c_str())) ok = false;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return ok && files > 0;
+}
+
+static void restoreSafetyMods(wchar_t* message, int cap)
+{
+    static PlgEnt ents[MM_MAX_PLUGINS];
+    const int n = collectPlugins(ents, MM_MAX_PLUGINS);
+    auto ids = readRecovery();
+    // Commit even an empty journal: never import an old safety report again.
+    if (!saveRecovery(ids))
+    {
+        lstrcpynW(message, TR(L"복구 기록을 저장하지 못했습니다. 모드는 변경하지 않았습니다.",
+                             L"Could not save the recovery record. No mods were changed."), cap);
+        return;
+    }
+    std::vector<std::wstring> pending;
+    int restored = 0;
+    for (const auto& id : ids)
+    {
+        const int i = recoveryMatch(id, ents, n);
+        if (i < 0) { pending.push_back(id); continue; }
+        static PlgRow r; // option storage is too large for the game-thread stack
+        memset(&r, 0, sizeof(r));
+        lstrcpynW(r.name, ents[i].name, 64);
+        lstrcpynW(r.rel, ents[i].rel, 192);
+        r.pak = ents[i].pak;
+        loadManifest(r);
+        r.on = true;
+        applyPluginState(r);
+        if (restoredEntryReady(r)) ++restored;
+        else pending.push_back(id);
+    }
+    const bool saved = saveRecovery(pending);
+    swprintf(message, cap,
+        TR(L"안전모드 복구: %d개 완료, %d개 보류.\n게임을 재시작하면 완전히 적용됩니다.\n보류 항목은 파일 누락·이름 중복·연결 실패를 확인한 뒤 다시 시도하세요.%s",
+           L"Safety recovery: %d restored, %d pending.\nRestart the game to fully apply changes.\nFor pending items, check missing files, ambiguous names or link failures, then retry.%s"),
+        restored, (int)pending.size(), saved ? L"" : TR(L"\n복구 기록 저장 실패: 기존 목록이 유지됩니다.",
+                                                      L"\nCould not update the record; the previous list is retained."));
+    logf("recovery: restored=%d pending=%d saved=%d", restored, (int)pending.size(), (int)saved);
+}
+
+static bool autoStart(wchar_t* message, int cap)
+{
+    if (autoActive()) { lstrcpynW(message,TR(L"자동복구가 이미 실행 중입니다.",L"Recovery is already running."),cap); return false; }
+    wchar_t root[MAX_PATH * 2]; modRootPath(root);
+    std::wstring dir = std::wstring(root) + L"autorecovery";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring helper = std::wstring(root) + L"recovery_watchdog.ps1";
+    if (!pathExistsW(helper.c_str())) {
+        lstrcpynW(message, TR(L"복구 도우미 파일이 없습니다. 배포 파일을 다시 설치하세요.", L"Recovery helper is missing. Reinstall the package."), cap); return false;
+    }
+    static PlgEnt ents[MM_MAX_PLUGINS];
+    int n = collectPlugins(ents, MM_MAX_PLUGINS);
+    std::vector<std::wstring> ids;
+    // On game updates the existing safety guard disables mods. Do not diagnose
+    // that deliberately disabled set as if it had actually been loaded.
+    wchar_t bp[MAX_PATH*2]; bootStatePath(bp);
+    auto prev=readFileA(bp); ULONGLONG es=0, em=0;
+    bool update=gameExeInfo(&es,&em) && bootStateGet(prev,"exe_size") &&
+        (es!=bootStateGet(prev,"exe_size") || em!=bootStateGet(prev,"exe_mtime"));
+    if (!update) for (int i=0; i<n; ++i) if (pluginEnabled(ents[i].name, ents[i].rel, ents[i].pak))
+        ids.push_back(pluginId(ents[i].name,ents[i].rel,ents[i].pak));
+    wchar_t exe[MAX_PATH * 2]; GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+    // UUID-shaped session, unique process/time/counter; not a security token.
+    static unsigned counter = 0;
+    wchar_t session[64];
+    swprintf(session, 64, L"%08lx-%04x-%04x-%04x-%012llx", GetCurrentProcessId(),
+             (unsigned)(GetTickCount64() & 65535), ++counter & 65535, (unsigned)(nowFileTime() & 65535),
+             (unsigned long long)(nowFileTime() & 0xffffffffffffULL));
+    std::string plan = "{\"mode\":\"watch\",\"session\":" + jsonString(session) + ",\"exe\":" + jsonString(exe) +
+                       ",\"initial_pid\":" + std::to_string(GetCurrentProcessId()) + ",\"items\":[";
+    int count = 0;
+    std::vector<std::wstring> normalized;
+    for (const auto& id : ids) {
+        int i = recoveryMatch(id, ents, n);
+        if (i < 0) {
+            lstrcpynW(message, TR(L"누락되었거나 동명이 중복된 복구 항목이 있습니다. 먼저 목록을 정리하세요.",
+                                 L"Missing or ambiguous recovery entries. Resolve them before starting."), cap); return false;
+        }
+        static PlgRow r; memset(&r, 0, sizeof(r));
+        lstrcpynW(r.name, ents[i].name, 64); lstrcpynW(r.rel, ents[i].rel, 192); r.pak = ents[i].pak;
+        loadManifest(r); // reads existing settings only; never saveOptionValues
+        auto key = pluginId(r.name, r.rel, r.pak);
+        if (std::find(normalized.begin(), normalized.end(), key) != normalized.end()) continue;
+        normalized.push_back(key);
+        if (count++) plan += ',';
+        plan += "{\"id\":" + jsonString(key) + ",\"name\":" + jsonString(r.name) + ",\"rel\":" + jsonString(r.rel) +
+                ",\"kind\":\"" + (r.pak ? "pak" : "script") + "\",\"target\":\"" +
+                (_stricmp(r.pakTarget, "logicmods") == 0 ? "LogicMods" : "~mods") + "\"}";
+    }
+    plan += "]}";
+    if (!autoWrite(L"plan.json", plan)) {
+        lstrcpynW(message, TR(L"검사 기록 저장 실패. 모드는 변경하지 않았습니다.", L"Could not save the test plan. No mods changed."), cap); return false;
+    }
+    // Preserve previous investigation results instead of silently overwriting history.
+    for (const auto* f : {L"state.json", L"status.txt", L"suspects.txt"}) {
+        auto old = autoPath(f), archived = old + L"." + session;
+        if (pathExistsW(old.c_str()) && !MoveFileExW(old.c_str(), archived.c_str(), MOVEFILE_WRITE_THROUGH)) {
+            lstrcpynW(message, TR(L"이전 검사 기록을 보관하지 못했습니다.", L"Could not archive previous results."), cap); return false;
+        }
+    }
+    DeleteFileW(autoPath(L"stop.txt").c_str());
+    DeleteFileW(autoPath(L"command.txt").c_str());
+    wchar_t sys[MAX_PATH]; GetSystemDirectoryW(sys, MAX_PATH);
+    std::wstring ps = std::wstring(sys) + L"\\WindowsPowerShell\\v1.0\\powershell.exe";
+    std::wstring cmd = L"\"" + ps + L"\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + helper +
+                       L"\" -ManagerRoot \"" + std::wstring(root).substr(0, wcslen(root)-1) + L"\"";
+    STARTUPINFOW si{}; si.cb = sizeof(si); si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(ps.c_str(), cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, root, &si, &pi)) {
+        lstrcpynW(message, TR(L"복구 도우미 실행 실패. 모드는 변경하지 않았습니다.", L"Could not start recovery helper. No mods changed."), cap); return false;
+    }
+    g_autoStartingPid=pi.dwProcessId; g_autoStartingUntil=GetTickCount64()+5000;
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    lstrcpynW(message, TR(L"이번 실행의 크래시 감시를 시작했습니다.",
+                         L"Crash monitoring attached to this launch."), cap);
+    return true;
+}
+
 // 모든 플러그인을 강제로 내린다 (로드 계층 + 런타임 계층). 되돌릴 목록을 남긴다.
 static int forceAllPluginsOff(const wchar_t* reason)
 {
     static PlgEnt ents[MM_MAX_PLUGINS];
     int n = collectPlugins(ents, MM_MAX_PLUGINS);
+    snapshotRecovery(ents, n); // persist before deleting any enabled marker
     std::string list;
     int off = 0;
     g_safeModeList[0] = 0;      // v0.50: 팝업용 표시 목록 리셋
@@ -3526,17 +3900,22 @@ static int forceAllPluginsOff(const wchar_t* reason)
         lstrcatW(pen, L"\\enabled.txt");
         // v0.50(리뷰 D1): mods.txt "<이름> : 1" 로만 켜진 모드도 '켜져 있었다'로 센다
         // -- 패널 r.on 과 동일한 3중 판정. 빠뜨리면 조용히 꺼놓고 목록/팝업에서 누락.
-        bool was = pathExistsW(en) || pathExistsW(pen) || modsTxtEnabled(ents[i].name);
-        if (was) { DeleteFileW(en); DeleteFileW(pen); }
-        modsTxtDisable(ents[i].name);
-        removeModEntry(ents[i].name);  // v0.26: 정션 진입점까지 걷어낸다
+        bool was = pluginEnabled(ents[i].name, ents[i].rel, ents[i].pak);
+        if (was) DeleteFileW(pen);
+        if (!ents[i].pak)
+        {
+            DeleteFileW(en);
+            modsTxtDisable(ents[i].name);
+            removeModEntry(ents[i].name);
+        }  // v0.26: 정션 진입점까지 걷어낸다
         if (ents[i].pak)               // v0.27: pak 링크도 뗀다 (양쪽 타깃 모두)
         {
             linkPakFiles(ents[i].rel[0] ? ents[i].rel : ents[i].name, L"LogicMods", false, ents[i].name);
             linkPakFiles(ents[i].rel[0] ? ents[i].rel : ents[i].name, L"~mods", false, ents[i].name);
         }
-        writeRuntimeFlag(ents[i].name, ents[i].rel, false);  // 이번 실행 최선 (협조 모드는 즉시 멎는다)
-        if (const char* k = rtKeyOf(ents[i].name)) rtSetKey(k, false);
+        writeRuntimeFlag(ents[i].name, ents[i].rel, false, ents[i].pak);  // 이번 실행 최선 (협조 모드는 즉시 멎는다)
+        if (!ents[i].pak)
+            if (const char* k = rtKeyOf(ents[i].name)) rtSetKey(k, false);
         if (was)
         {
             ++off;
@@ -3795,6 +4174,7 @@ static void blackboxTick(ULONGLONG now)
    않는다 (bootGuard 의 감지 조건을 소모하면 안 된다). */
 static void earlyBootGuard()
 {
+    if (autoOwnsBoot()) { logf("earlyGuard: external recovery owns this launch"); return; }
     wchar_t p[MAX_PATH * 2];
     bootStatePath(p);
     std::string prev = readFileA(p);
@@ -3821,7 +4201,7 @@ static void earlyBootGuard()
         gameModsRoot(en);
         lstrcatW(en, ents[i].name);
         lstrcatW(en, L"\\enabled.txt");
-        bool on = pathExistsW(pen) || pathExistsW(en) || modsTxtEnabled(ents[i].name);
+        bool on = pluginEnabled(ents[i].name, ents[i].rel, ents[i].pak);
         if (on && (updated || crashed))
         {   // 위험 감지 -- 링크만 선제 해제 (identity 검증은 linkPakFiles 내부에서)
             int k = linkPakFiles(rel, L"LogicMods", false, ents[i].name) +
@@ -3892,7 +4272,7 @@ static void earlyBootGuard()
             wchar_t src2[MAX_PATH * 2] = {0};
             for (int i = 0; i < n; ++i)
             {
-                if (_wcsicmp(ents[i].name, ownerW) != 0) continue;
+                if (!ents[i].pak || _wcsicmp(ents[i].name, ownerW) != 0) continue;
                 ownerFound = true;
                 const wchar_t* rel2 = ents[i].rel[0] ? ents[i].rel : ents[i].name;
                 wchar_t pen2[MAX_PATH * 2];
@@ -3902,7 +4282,7 @@ static void earlyBootGuard()
                 gameModsRoot(en2);
                 lstrcatW(en2, ents[i].name);
                 lstrcatW(en2, L"\\enabled.txt");
-                ownerOn = pathExistsW(pen2) || pathExistsW(en2) || modsTxtEnabled(ents[i].name);
+                ownerOn = pluginEnabled(ents[i].name, ents[i].rel, true);
                 pluginSrcPath(src2, rel2);
                 lstrcatW(src2, L"\\");
                 lstrcatW(src2, fileW);
@@ -3971,7 +4351,7 @@ static bool isContractFile(const wchar_t* n)
 {
     static const wchar_t* const F[] = {
         L"dsoptions.txt", L"dsruntime.txt", L"enabled.txt", L"dsnotify.txt",
-        L"version.txt", L"bootstate.txt", L"safemode_last.txt",
+        L"version.txt", L"bootstate.txt", L"safemode_last.txt", L"safemode_restore.txt", L"safemode_restore.txt.tmp",
     };
     for (const wchar_t* f : F)
         if (_wcsicmp(n, f) == 0) return true;
@@ -4136,6 +4516,7 @@ static void bootGuard()
     // 이번 실행 시각을 먼저 기록한다 -- 지금부터 생기는 덤프가 '이번 실행의 크래시'다.
     writeBootState(nowFileTime(), size, mtime);
 
+    if (autoOwnsBoot()) { logf("bootGuard: external recovery owns this launch"); return; }
     if (!updated && !crashed) return;
     const wchar_t* reason = updated ? L"게임 업데이트 감지" : L"직전 실행 비정상 종료";
     int off = forceAllPluginsOff(reason);
@@ -4673,7 +5054,7 @@ static bool optHasChildren(PlgRow& r, int oi)
 
 // v0.16: 옵션 접힘 UI 의 '펼침' 상태 -- 패널 재구축(needReopen)을 넘어 세션 동안
 // 유지해야 하므로 PlgRow(패널 수명) 밖의 폴더명 키 목록으로 기억한다.
-static wchar_t g_expandedMods[MM_MAX_PLUGINS][64];
+static wchar_t g_expandedMods[MM_MAX_PLUGINS][224];
 static int g_expandedN = 0;
 
 static bool isExpanded(const wchar_t* name)
@@ -4688,10 +5069,10 @@ static void setExpanded(const wchar_t* name, bool on)
     for (int i = 0; i < g_expandedN; ++i)
     {
         if (_wcsicmp(g_expandedMods[i], name) != 0) continue;
-        if (!on) lstrcpynW(g_expandedMods[i], g_expandedMods[--g_expandedN], 64);
+        if (!on) lstrcpynW(g_expandedMods[i], g_expandedMods[--g_expandedN], 224);
         return;
     }
-    if (on && g_expandedN < MM_MAX_PLUGINS) lstrcpynW(g_expandedMods[g_expandedN++], name, 64);
+    if (on && g_expandedN < MM_MAX_PLUGINS) lstrcpynW(g_expandedMods[g_expandedN++], name, 224);
 }
 
 // ======================= v0.2: 메뉴 항목 호버 ==============================
@@ -5068,6 +5449,8 @@ static void closePanel(const char* why)
     g_panelOpen = false;
     for (int i = 0; i < 3; ++i) g_hsX[i] = nullptr;
     for (int i = 0; i < 3; ++i) g_hsBtn[i] = nullptr;
+    g_restoreHs = nullptr;
+    g_autoHs = g_autoHelpHs = nullptr;
     g_hsTab[0] = g_hsTab[1] = nullptr;  // v0.16 탭/순서 상태 무효화
     g_ordN = 0;
     g_dragIdx = -1;
@@ -5861,6 +6244,15 @@ static bool openPanel(UObject* clone)
         navAdd(NAVK_FOLDER, -1, -1);   // v0.40(pad)
     }
 
+    g_restoreHs = nullptr;
+    g_autoHs = g_autoHelpHs = nullptr;
+    g_autoHs = g_autoHelpHs = nullptr;
+    if (UObject* hb = addRow(TR(L"자동일괄복구모드", L"Automatic recovery"), "panel.rowAuto"))
+        if (makeButton(hb, autoEnabled() ? TR(L"ON · 누르면 OFF", L"ON - switch OFF") : L"OFF", &g_autoHs))
+            navAdd(NAVK_AUTO, -1, -1);
+    if (UObject* hb = addRow(TR(L"자동복구 안내 · 검사 결과", L"Recovery help / results"), "panel.rowAutoHelp"))
+        if (makeButton(hb, TR(L"설명 보기", L"Details"), &g_autoHelpHs)) navAdd(NAVK_AUTOHELP, -1, -1);
+
     // ---- 기본 (계속): 언어(Language) -- 매니저 자체 UI 언어 [v0.40] ----
     g_langHs = g_langTx = nullptr;
     if (UObject* hb = addRow(TR(L"언어(Language)", L"Language"), "panel.rowLang"))
@@ -5961,7 +6353,7 @@ static bool openPanel(UObject* clone)
                     gameModsRoot(en);
                     lstrcatW(en, r.name);
                     lstrcatW(en, L"\\enabled.txt");
-                    r.on = pathExistsW(pen) || pathExistsW(en) || modsTxtEnabled(r.name);
+                    r.on = pluginEnabled(r.name, r.rel, r.pak);
                 }
                 if (UObject* hb2 = addRow(r.label[0] ? r.label : r.name, "panel.rowMod"))
                 {
@@ -6004,21 +6396,66 @@ static bool openPanel(UObject* clone)
                         // ---- 켜진 모드의 옵션 서브행 (들여쓴 라벨 + 토글/스테퍼) ----
                         if (r.on)
                         {
-                            // v0.16: 보이는 옵션이 FOLD_OVER 초과면 앞 FOLD_SHOW 개만
-                            // 그리고 '펼치기' 행을 붙인다 (펼침 상태는 세션 유지).
-                            // v0.17: 요청대로 8개째부터 접힘 (7개까지는 전부 표시)
-                            const int FOLD_OVER = 7, FOLD_SHOW = 7;
+                            // Fold settings in full, with the control before its children.
                             int visTotal = 0;
                             for (int oi = 0; oi < r.optN; ++oi)
                                 if (optVisible(r, oi)) ++visTotal;
-                            bool folded = visTotal > FOLD_OVER && !isExpanded(r.name);
-                            int builtOpt = 0;
+                            bool folded = !isExpanded(pluginId(r.name, r.rel, r.pak).c_str());
+                            if (visTotal > 0)
+                            {
+                                // 펼치기/접기 행 (옵션 밴드보다 얕은 톤, 가운데 글자)
+                                UObject* rowBox = spawn(sCls, "panel.foldRow");
+                                UObject* band = rowBox ? spawn(bCls, "panel.foldBand") : nullptr;
+                                UObject* ftxt = band ? spawn(tCls, "panel.foldTxt") : nullptr;
+                                if (rowBox && band && ftxt)
+                                {
+                                    float fh = 72.0f;
+                                    callBytes(rowBox, L"SetHeightOverride", &fh, 4, "panel.foldRow");
+                                    setVisibility(rowBox, 4, "panel.foldRow");
+                                    setBrushColor(band, {1, 1, 1, 0.05f}, "panel.foldBand");
+                                    setVisibility(band, 0, "panel.foldBand");  // 히트 대상
+                                    {
+                                        float m[4] = {0, 0, 74, 0};
+                                        callBytes(band, L"SetPadding", m, 16, "panel.foldBand");
+                                    }
+                                    {   // v0.40(pad): 선택 테두리
+                                        UObject* selOut = spawn(bCls, "panel.foldBand");
+                                        if (selOut)
+                                        {
+                                            if (texSelFrame) callBytes(selOut, L"SetBrushFromTexture", &texSelFrame, 8, "panel.foldBand");
+            setBrushColor(selOut, {0.95f, 0.92f, 0.80f, 0.0f}, "panel.foldBand");
+                                            setVisibility(selOut, 4, "panel.foldBand");
+                                            float sm[4] = {3, 3, 3, 3};
+                                            callBytes(selOut, L"SetPadding", sm, 16, "panel.foldBand");
+                                            slotAlign(addChildTo(rowBox, selOut, "panel.foldBand"), 0, 0, "panel.foldBand");
+                                            slotAlign(addChildTo(selOut, band, "panel.foldBand"), 0, 0, "panel.foldBand");
+                                        }
+                                        else slotAlign(addChildTo(rowBox, band, "panel.foldBand"), 0, 0, "panel.foldBand");
+                                        g_lastRowOutline = selOut;
+                                        g_lastRowBox = rowBox;
+                                        navAdd(NAVK_FOLD, g_plgN, -1);
+                                    }
+                                    wchar_t cap[64];
+                                    if (folded)
+                                        swprintf(cap, 64, TR(L"설정 펼치기 ▼   (%d개)", L"Expand settings ▼   (%d)"), visTotal);
+                                    else
+                                        lstrcpynW(cap, TR(L"설정 접기 ▲", L"Collapse settings ▲"), 64);
+                                    setTextOn(ftxt, cap, "panel.foldTxt");
+                                    setTextColor(ftxt, {0.70f, 0.74f, 0.78f, 1.0f}, "panel.foldTxt");
+                                    applyFontScaled(ftxt, 0.8f);
+                                    setVisibility(ftxt, 4, "panel.foldTxt");
+                                    slotAlign(addChildTo(band, ftxt, "panel.foldTxt"), 2, 2, "panel.foldTxt");
+                                    UObject* s = addChildTo(vbC, rowBox, "panel.foldRow");
+                                    slotAlign(s, 0, -1, "panel.foldRow");
+                                    slotPad(s, 0, 8, 38, 0, "panel.foldRow");
+                                    r.expandHs = band;
+                                }
+                            }
                             for (int oi = 0; oi < r.optN; ++oi)
                             {
                                 PlgOpt& o = r.opt[oi];
                                 if (!optVisible(r, oi)) continue;  // v0.13: 부모 조건 미충족 자식은 숨김
-                                if (folded && builtOpt >= FOLD_SHOW) break;  // 접힌 나머지는 UI 없음(널 포인터)
-                                ++builtOpt;
+                                if (folded) break;  // 접힌 나머지는 UI 없음(널 포인터)
                                 UObject* rowBox = spawn(sCls, "panel.optRow");
                                 if (!rowBox) break;
                                 float fh = 88.0f;
@@ -6186,56 +6623,6 @@ static bool openPanel(UObject* clone)
                                 slotAlign(s, 0, -1, "panel.optRow");
                                 slotPad(s, 0, 8, 38, 0, "panel.optRow");
                             }
-                            if (visTotal > FOLD_OVER)
-                            {
-                                // 펼치기/접기 행 (옵션 밴드보다 얕은 톤, 가운데 글자)
-                                UObject* rowBox = spawn(sCls, "panel.foldRow");
-                                UObject* band = rowBox ? spawn(bCls, "panel.foldBand") : nullptr;
-                                UObject* ftxt = band ? spawn(tCls, "panel.foldTxt") : nullptr;
-                                if (rowBox && band && ftxt)
-                                {
-                                    float fh = 72.0f;
-                                    callBytes(rowBox, L"SetHeightOverride", &fh, 4, "panel.foldRow");
-                                    setVisibility(rowBox, 4, "panel.foldRow");
-                                    setBrushColor(band, {1, 1, 1, 0.05f}, "panel.foldBand");
-                                    setVisibility(band, 0, "panel.foldBand");  // 히트 대상
-                                    {
-                                        float m[4] = {0, 0, 74, 0};
-                                        callBytes(band, L"SetPadding", m, 16, "panel.foldBand");
-                                    }
-                                    {   // v0.40(pad): 선택 테두리
-                                        UObject* selOut = spawn(bCls, "panel.foldBand");
-                                        if (selOut)
-                                        {
-                                            if (texSelFrame) callBytes(selOut, L"SetBrushFromTexture", &texSelFrame, 8, "panel.foldBand");
-            setBrushColor(selOut, {0.95f, 0.92f, 0.80f, 0.0f}, "panel.foldBand");
-                                            setVisibility(selOut, 4, "panel.foldBand");
-                                            float sm[4] = {3, 3, 3, 3};
-                                            callBytes(selOut, L"SetPadding", sm, 16, "panel.foldBand");
-                                            slotAlign(addChildTo(rowBox, selOut, "panel.foldBand"), 0, 0, "panel.foldBand");
-                                            slotAlign(addChildTo(selOut, band, "panel.foldBand"), 0, 0, "panel.foldBand");
-                                        }
-                                        else slotAlign(addChildTo(rowBox, band, "panel.foldBand"), 0, 0, "panel.foldBand");
-                                        g_lastRowOutline = selOut;
-                                        g_lastRowBox = rowBox;
-                                        navAdd(NAVK_FOLD, g_plgN, -1);
-                                    }
-                                    wchar_t cap[64];
-                                    if (folded)
-                                        swprintf(cap, 64, TR(L"펼치기 ▼   (옵션 %d개 더)", L"Expand ▼   (%d more options)"), visTotal - FOLD_SHOW);
-                                    else
-                                        lstrcpynW(cap, TR(L"접기 ▲", L"Collapse ▲"), 64);
-                                    setTextOn(ftxt, cap, "panel.foldTxt");
-                                    setTextColor(ftxt, {0.70f, 0.74f, 0.78f, 1.0f}, "panel.foldTxt");
-                                    applyFontScaled(ftxt, 0.8f);
-                                    setVisibility(ftxt, 4, "panel.foldTxt");
-                                    slotAlign(addChildTo(band, ftxt, "panel.foldTxt"), 2, 2, "panel.foldTxt");
-                                    UObject* s = addChildTo(vbC, rowBox, "panel.foldRow");
-                                    slotAlign(s, 0, -1, "panel.foldRow");
-                                    slotPad(s, 0, 8, 38, 0, "panel.foldRow");
-                                    r.expandHs = band;
-                                }
-                            }
                             for (int oi = 0; oi < r.optN; ++oi) paintOpt(r.opt[oi]);
                         }
                         ++g_plgN;
@@ -6291,7 +6678,7 @@ static bool openPanel(UObject* clone)
         {
             OrderRow& orow = g_ord[g_ordN];
             memset(&orow, 0, sizeof(orow));
-            lstrcpynW(orow.name, ents[k].name, 64);
+            lstrcpynW(orow.name, pluginId(ents[k].name, ents[k].rel, ents[k].pak).c_str(), 224);
             {   // 표시명: 매니페스트 [plugin] name= 만 가볍게 읽는다 (옵션 파싱 불필요)
                 wchar_t mp[MAX_PATH * 2];
                 pluginSrcPath(mp, ents[k].rel[0] ? ents[k].rel : ents[k].name);
@@ -6304,7 +6691,7 @@ static bool openPanel(UObject* clone)
                     if (!nm.empty()) utf8ToW(nm, orow.label, 64);
                 }
             }
-            if (!orow.label[0]) lstrcpynW(orow.label, orow.name, 64);
+            if (!orow.label[0]) lstrcpynW(orow.label, ents[k].name, 64);
             // 행: 밴드(히트/하이라이트) + ≡ 핸들 + 라벨
             UObject* rowBox = spawn(sCls, "panel.ordRow");
             if (!rowBox) break;
@@ -6467,6 +6854,8 @@ static bool openPanel(UObject* clone)
         g_restoreWaitDir = false;
         for (int i = 0; i < 3; ++i) g_hsX[i] = nullptr;
         for (int i = 0; i < 3; ++i) g_hsBtn[i] = nullptr;
+    g_restoreHs = nullptr;
+    g_autoHs = g_autoHelpHs = nullptr;
         g_plgN = 0;
         return false;
     }
@@ -6497,6 +6886,7 @@ static bool openPanel(UObject* clone)
 
 static void closePopup(const char* why)
 {
+    g_autoConfirm = false;
     g_popupOpen = false;
     g_hsPop[0] = g_hsPop[1] = nullptr;
     g_popupPadIcon = nullptr;   // v0.50: 팝업과 함께 죽는다
@@ -6519,12 +6909,13 @@ static void closePopup(const char* why)
 // Button_Confirm@0x458 등) 복제를 1차 시도. 팝업 BP 는 요청 시 로드라 타이틀에서
 // 클래스가 없을 수 있고, 그때는 설정창 스타일 원시 팝업으로 폴백한다.
 // v0.14: desc 로 본문 교체 가능 (모드발 dsnotify 신호의 사용자 정의 메시지)
-static bool showRestartPopup(const wchar_t* desc = nullptr)
+static bool showRestartPopup(const wchar_t* desc = nullptr, bool confirmAuto = false)
 {
     if (g_popupOpen) return true;
     g_popupPadIcon = nullptr;   // v0.50 리뷰: 실패 경로가 스테일 포인터를 남기지 않게
-    const wchar_t* descText = desc ? desc : TR(L"모드 적용을 위해 게임 재시작이 필요합니다.",
-                                               L"A game restart is needed to apply the mod.");
+    g_autoConfirm = confirmAuto;
+    const wchar_t* descText = desc ? desc : TR(L"모드 켜기·끄기는 게임 재시작 후 완전히 적용됩니다.\n일부 실시간 제어 지원 모드는 즉시 반응할 수 있습니다.",
+                                               L"Restart the game to fully apply mod activation or deactivation.\nSome mods supporting runtime control may respond immediately.");
     // v0.25: 띄운 문구를 그대로 로그에 남긴다 -- 사용자가 팝업을 닫아 버려도
     // 무슨 일이 있었는지 cppmm_log.txt 만 보면 재구성된다.
     logf("popup 요청: \"%s\"", u8(descText).c_str());
@@ -6548,7 +6939,7 @@ static bool showRestartPopup(const wchar_t* desc = nullptr)
     };
 
     // ---- 1차: 게임 팝업 복제 ----
-    if (UObject* popCls = findObj(L"/Game/UI/Popup/DPopupDefault.DPopupDefault_C", "popup.cls"))
+    if (UObject* popCls = confirmAuto ? nullptr : findObj(L"/Game/UI/Popup/DPopupDefault.DPopupDefault_C", "popup.cls"))
     {
         if (UObject* pop = createW(popCls))
         {
@@ -6793,16 +7184,77 @@ static bool showRestartPopup(const wchar_t* desc = nullptr)
         slotPad(s, 0, 40, 0, 0, "popup.ok");
     }
 
+    UObject* cancelAuto = nullptr;
+    if (confirmAuto) {
+        cancelAuto = spawn2(bCls);
+        UObject* text = spawn2(tCls);
+        if (!cancelAuto || !text || !okOutline) { g_autoConfirm = false; return false; }
+        setVisibility(cancelAuto, 0, "popup.cancelAuto");
+        setBrushColor(cancelAuto, {0.13f,0.15f,0.16f,1}, "popup.cancelAuto");
+        setVisibility(text, 4, "popup.cancelAuto");
+        setTextOn(text, TR(L"취소 (ESC / B)", L"Cancel (ESC / B)"), "popup.cancelAuto");
+        pfont(text, 0.9f);
+        float padding[4]={16,12,16,12}; callBytes(cancelAuto,L"SetPadding",padding,16,"popup.cancelAuto");
+        setTextColor(text, {0.97f,0.97f,0.98f,1}, "popup.cancelAuto");
+        slotAlign(addChildTo(cancelAuto,text,"popup.cancelAuto"),2,2,"popup.cancelAuto");
+        slotPad(addChildTo(pvb,cancelAuto,"popup.cancelAuto"),0,18,0,0,"popup.cancelAuto");
+    }
     setVisibility(host, 0, "popup.host");
     int z = 1100;
     if (!callBytes(host, L"AddToViewport", &z, 4, "popup.viewport")) return false;
     g_popup = (void*)host;
     g_hsPop[0] = okOutline;
-    g_hsPop[1] = nullptr;
+    g_hsPop[1] = cancelAuto;
     g_popupOpen = true;
     if (mc) startPulseTimer(mc);  // v0.8: 펄스 재무장
     logf("popup: 원시 폴백 표시 (DPopupDefault 미로드)");
     return true;
+}
+
+static void autoDialog(bool helpOnly)
+{
+    if (!helpOnly && autoEnabled()) {
+        if(!autoStop()) { showRestartPopup(TR(L"중단 설정을 저장하지 못했습니다. 도우미가 계속 실행 중일 수 있습니다.", L"Could not save stop setting. The watchdog may still be running.")); return; }
+        g_autoRefresh=true;
+        showRestartPopup(TR(L"자동복구를 중단했습니다. 현재 설정값은 그대로 유지됩니다.", L"Automatic recovery stopped. Existing settings are preserved."));
+        return;
+    }
+    std::wstring message;
+    if (!helpOnly) message = TR(L"자동일괄복구모드를 ON 하시겠습니까?\n\n", L"Enable automatic recovery?\n\n");
+    message += autoHelp();
+    if (helpOnly) {
+        auto state = readFileA(autoPath(L"status.txt").c_str());
+        if (!state.empty()) {
+            wchar_t detail[600];
+            auto phase=autoValue(state,"phase");
+            const wchar_t* label=phase=="complete" ? TR(L"검사 완료",L"Completed") :
+                phase=="paused" ? TR(L"검사 중단",L"Stopped") : phase=="watching" ? TR(L"크래시 감시 중",L"Monitoring") : phase=="armed" ? TR(L"다음 실행 감시 대기",L"Armed for next launch") : TR(L"검사 진행 중",L"In progress");
+            wchar_t current[224], suspects[224];
+            utf8ToW(autoValue(state,"current"),current,224);
+            utf8ToW(autoValue(state,"suspect_names"),suspects,224);
+            // Convert numeric protocol values without locale-dependent narrow formatting.
+            auto wide=[](const std::string& v){ return std::wstring(v.begin(),v.end()); };
+            swprintf(detail,600,TR(L"\n\n%s · %s (%s/%s)\n이번 검사 통과 %s개 / 충돌 의심 OFF %s개\nOFF 목록: %s",
+                                   L"\n\n%s - %s (%s/%s)\nPassed this check: %s / Suspects OFF: %s\nOFF list: %s"),
+                label,current,wide(autoValue(state,"index")).c_str(),wide(autoValue(state,"total")).c_str(),
+                wide(autoValue(state,"passed")).c_str(),wide(autoValue(state,"suspect")).c_str(),suspects);
+            message += detail;
+            if(phase=="paused") message+=TR(L"\nOFF로 중단했거나 검사·재시작 조건을 확인하지 못했습니다.\n자세한 기록: 매니저 폴더의 autorecovery/state.json",L"\nStopped by request or unable to verify the test/restart conditions.\nDetails: autorecovery/state.json in the manager folder.");
+        }
+    }
+    if (!showRestartPopup(message.c_str(), !helpOnly)) g_autoConfirm = false;
+}
+static void finishAutoConfirm(bool accepted)
+{
+    const bool start = g_autoConfirm && accepted;
+    closePopup(accepted ? "confirm" : "cancel");
+    if (start) {
+        bool saved=autoSetEnabled(true);
+        g_autoRefresh=true;
+        showRestartPopup(saved ? TR(L"감시를 예약했습니다. 지금은 모드 상태를 변경하지 않습니다.\n다음 게임 실행에서 크래시가 확인될 때 순차 복구를 시작합니다.",
+                                    L"Monitoring armed. No mod states change now.\nA confirmed crash from the next game launch starts sequential recovery.") :
+                                 TR(L"감시 설정을 저장하지 못했습니다.",L"Could not save monitoring settings."));
+    }
 }
 
 // ======================= v0.15: 콤보 드롭다운 ==============================
@@ -7767,12 +8219,12 @@ static bool padPanelInput(unsigned pe, UObject* clone)
             int a = g_padOrdLift, b2 = a + dir;
             if (b2 >= 0 && b2 < g_ordN)
             {
-                wchar_t tn[64], tl[64];
-                lstrcpynW(tn, g_ord[a].name, 64);
+                wchar_t tn[224], tl[64];
+                lstrcpynW(tn, g_ord[a].name, 224);
                 lstrcpynW(tl, g_ord[a].label, 64);
-                lstrcpynW(g_ord[a].name, g_ord[b2].name, 64);
+                lstrcpynW(g_ord[a].name, g_ord[b2].name, 224);
                 lstrcpynW(g_ord[a].label, g_ord[b2].label, 64);
-                lstrcpynW(g_ord[b2].name, tn, 64);
+                lstrcpynW(g_ord[b2].name, tn, 224);
                 lstrcpynW(g_ord[b2].label, tl, 64);
                 if (g_ord[a].text)
                     setTextOn(reinterpret_cast<UObject*>(g_ord[a].text), g_ord[a].label, "pad-ord");
@@ -7809,10 +8261,24 @@ static bool padPanelInput(unsigned pe, UObject* clone)
     bool act = (pe & PAD_A) != 0;
     if (!dir && !act) return false;
 
+    if (nv.kind == NAVK_AUTO || nv.kind == NAVK_AUTOHELP) {
+        if (act) autoDialog(nv.kind == NAVK_AUTOHELP);
+        return false;
+    }
     if (nv.kind == NAVK_FOLDER)
     {
         if (act) openPluginsFolder();
         return false;
+    }
+    if (nv.kind == NAVK_RESTORE)
+    {
+        if (!act) return false;
+        wchar_t message[768];
+        restoreSafetyMods(message, 768);
+        rebuildPanel(clone, "안전모드 복구(패드)");
+        navAfterRebuild();
+        showRestartPopup(message);
+        return true;
     }
     if (nv.kind == NAVK_LANG)
     {
@@ -7844,7 +8310,7 @@ static bool padPanelInput(unsigned pe, UObject* clone)
         if (act)
         {
             PlgRow& r = g_plg[nv.row];
-            setExpanded(r.name, !isExpanded(r.name));
+            setExpanded(pluginId(r.name, r.rel, r.pak).c_str(), !isExpanded(pluginId(r.name, r.rel, r.pak).c_str()));
             rebuildPanel(clone, "펼치기(패드)");
             navAfterRebuild();
             return true;
@@ -7853,14 +8319,16 @@ static bool padPanelInput(unsigned pe, UObject* clone)
     }
     if (nv.kind == NAVK_MOD && nv.row >= 0 && nv.row < g_plgN)
     {
+        if (autoOwnsBoot()) { showRestartPopup(TR(L"모드를 직접 바꾸려면 자동복구를 먼저 OFF로 전환하세요.", L"Switch automatic recovery OFF before changing mods.")); return false; }
         PlgRow& r = g_plg[nv.row];
         bool want = act ? !r.on : (dir > 0);
         if (want != r.on)
         {
             r.on = want;
             paintToggle(r);
+            autoLoadSetChanged();
             applyPluginState(r);
-            bool pop = r.on && !sessionLoaded(r.name);
+            bool pop = true;
             // v0.50: 미로드 모드는 옵션이 없어도 재구축 -- '재시작 필요' 배지 갱신
             if (r.optN || !sessionLoaded(r.name))
             {
@@ -8054,6 +8522,92 @@ static bool padPanelInput(unsigned pe, UObject* clone)
     return false;
 }
 
+// Metadata APIs are exported by the bundled UE4SS.def. No struct layout copying.
+static int autoFieldLink(void* object, bool first, void** field)
+{
+    __try {
+        HMODULE ue = GetModuleHandleW(L"UE4SS.dll");
+        if (!ue) return -1;
+        if (first) {
+            using Fn = void**(__fastcall*)(void*);
+            auto fn = reinterpret_cast<Fn>(GetProcAddress(ue, "?GetChildProperties@UStruct@Unreal@RC@@QEAAAEAPEAVFField@23@XZ"));
+            if (!fn) return -1;
+            *field = *fn(object);
+        } else {
+            using Fn = void*(__fastcall*)(void*);
+            auto fn = reinterpret_cast<Fn>(GetProcAddress(ue, "?GetNextFieldAsProperty@FField@Unreal@RC@@QEAAPEAVFProperty@23@XZ"));
+            if (!fn) return -1;
+            *field = fn(object);
+        }
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+static int autoParam(UFunction* fn, const wchar_t* name, int size)
+{
+    void* field = nullptr;
+    if (autoFieldLink(fn, true, &field) != 0) return -1;
+    for (int i=0; field && i<32; ++i) {
+        auto prop = reinterpret_cast<FProperty*>(field);
+        int off = -1, actual = 0;
+        if (sehPropOffSize(prop, &off, &actual) != 0) return -1;
+        // Function metadata remains owned by the engine; no object pointer is cached.
+        if (prop->GetName() == name) {
+            if (actual != size || off < 0 || off + size > (int)fn->GetParmsSize()) return -1;
+            return off;
+        }
+        void* next = nullptr;
+        if (autoFieldLink(field, false, &next) != 0 || next == field) return -1;
+        field = next;
+    }
+    return -1;
+}
+static void autoGameTick(ULONGLONG now)
+{
+    static ULONGLONG last = 0;
+    if (now-last < 1000 || !g_autoLease.load(std::memory_order_relaxed)) return;
+    last=now;
+    if (!autoActive()) return;
+    auto state=readFileA(autoPath(L"status.txt").c_str());
+    auto session=autoValue(state,"session");
+    if (session.empty()) return;
+    auto command=readFileA(autoPath(L"command.txt").c_str());
+    bool quit=autoValue(command,"session")==session &&
+        autoValue(command,"pid")==std::to_string(GetCurrentProcessId()) && autoValue(command,"action")=="quit";
+    UObject* pc=UOG::FindFirstOf(L"PlayerController");
+    if (!pc) return;
+    if (quit) {
+        UObject* lib=findObj(L"/Script/Engine.Default__KismetSystemLibrary","auto.quit");
+        UFunction* fn=lib ? fnOf(lib,L"QuitGame","auto.quit") : nullptr;
+        if (!fn || fn->GetNumParms()!=4 || fn->GetParmsSize()>sizeof(PB)) return;
+        int world=autoParam(fn,L"WorldContextObject",8), player=autoParam(fn,L"SpecificPlayer",8);
+        int pref=autoParam(fn,L"QuitPreference",1), force=autoParam(fn,L"bIgnorePlatformRestrictions",1);
+        if (world<0 || player<0 || pref<0 || force<0) return;
+        if (world==player || pref==force || (pref>=world && pref<world+8) || (pref>=player && pref<player+8) ||
+            (force>=world && force<world+8) || (force>=player && force<player+8)) return;
+        PB pb; memcpy(pb.b+world,&pc,8); memcpy(pb.b+player,&pc,8);
+        // EQuitPreference::Quit=0, platform restrictions respected; no forced termination.
+        logf("autoRecovery: normal QuitGame request, session=%s",session.c_str());
+        peGuard(lib,fn,pb.b);
+        return;
+    }
+    if (autoValue(state,"pid") != std::to_string(GetCurrentProcessId())) return;
+    bool playing=false;
+    UObject* pawn=readObjProp(pc,L"Pawn","auto.pawn");
+    if (pawn && !g_myClone.load(std::memory_order_relaxed)) {
+        UObject* lib=findObj(L"/Script/Engine.Default__GameplayStatics","auto.pause");
+        UFunction* fn=lib ? fnOf(lib,L"IsGamePaused","auto.pause") : nullptr;
+        if (fn && fn->GetNumParms()==2 && fn->GetParmsSize()<=sizeof(PB)) {
+            int world=autoParam(fn,L"WorldContextObject",8), ret=autoParam(fn,L"ReturnValue",1);
+            if (world>=0 && ret>=0 && (ret<world || ret>=world+8)) {
+                PB pb; memcpy(pb.b+world,&pc,8);
+                if (peGuard(lib,fn,pb.b)) playing=pb.b[ret]==0;
+            }
+        }
+    }
+    autoWrite(L"heartbeat.txt","session="+session+"\npid="+std::to_string(GetCurrentProcessId())+
+        "\nplaying="+(playing ? "1" : "0")+"\ntick="+std::to_string(now)+"\n");
+}
+
 // ======================= v0.2: 33ms 게임스레드 펌프 ========================
 
 // PE 콜백에 편승해 33ms 간격으로 실행 (게임 스레드 판정 = 삽입 순간 캡처한
@@ -8061,6 +8615,11 @@ static bool padPanelInput(unsigned pe, UObject* clone)
 // -> 패널 열기, 패널 열림 중 ESC/X 닫기.
 static void pump(ULONGLONG now)
 {
+    autoGameTick(now);
+    if(g_autoRefresh && !g_popupOpen) {
+        g_autoRefresh=false;
+        if(auto mc=g_myClone.load(std::memory_order_relaxed)) { rebuildPanel(reinterpret_cast<UObject*>(mc),"auto state"); navAfterRebuild(); return; }
+    }
     void* mc = g_myClone.load(std::memory_order_relaxed);
     if (!mc && !g_panel && !g_panelOpen) return;
     g_reflFault = false;
@@ -8139,9 +8698,10 @@ static void pump(ULONGLONG now)
         {   // v0.40(pad): A = 확인. 그 외 패드 엣지는 버린다 -- 쌓아두면 팝업이
             // 닫힌 뒤 묵은 엣지가 재생된다 (리뷰 확정: 켠 모드가 도로 꺼졌다)
             unsigned pe = g_padEdges.exchange(0, std::memory_order_relaxed);
+
             if (pe & PAD_A)
             {
-                closePopup("확인(패드)");
+                finishAutoConfirm(true);
                 return;
             }
         }
@@ -8172,7 +8732,7 @@ static void pump(ULONGLONG now)
             {
                 if (g_hsPop[i] && isHovered(reinterpret_cast<UObject*>(g_hsPop[i]), "pop-hs") == 1)
                 {
-                    closePopup("확인");
+                    finishAutoConfirm(i == 0);
                     return;
                 }
             }
@@ -8648,16 +9208,16 @@ static void pump(ULONGLONG now)
             if (over >= 0 && over != g_dragIdx)
             {
                 // 내용(name/label)만 이동 -- 위젯(밴드/라벨)은 고정 슬롯
-                wchar_t tn[64], tl[64];
-                lstrcpynW(tn, g_ord[g_dragIdx].name, 64);
+                wchar_t tn[224], tl[64];
+                lstrcpynW(tn, g_ord[g_dragIdx].name, 224);
                 lstrcpynW(tl, g_ord[g_dragIdx].label, 64);
                 int step = over > g_dragIdx ? 1 : -1;
                 for (int i = g_dragIdx; i != over; i += step)
                 {
-                    lstrcpynW(g_ord[i].name, g_ord[i + step].name, 64);
+                    lstrcpynW(g_ord[i].name, g_ord[i + step].name, 224);
                     lstrcpynW(g_ord[i].label, g_ord[i + step].label, 64);
                 }
-                lstrcpynW(g_ord[over].name, tn, 64);
+                lstrcpynW(g_ord[over].name, tn, 224);
                 lstrcpynW(g_ord[over].label, tl, 64);
                 for (int i = 0; i < g_ordN; ++i)
                     if (g_ord[i].text)
@@ -8809,6 +9369,19 @@ static void pump(ULONGLONG now)
                     g_armHs = g_hsBtn[i];
                 }
             }
+            if (g_armKind == ARM_NONE && g_autoHs && isHovered(reinterpret_cast<UObject*>(g_autoHs), "auto-hs") == 1) {
+                g_armKind = ARM_AUTO; g_armHs = g_autoHs;
+            }
+            if (g_armKind == ARM_NONE && g_autoHelpHs && isHovered(reinterpret_cast<UObject*>(g_autoHelpHs), "autohelp-hs") == 1) {
+                g_armKind = ARM_AUTOHELP; g_armHs = g_autoHelpHs;
+            }
+            if (g_armKind == ARM_NONE && g_restoreHs &&
+                isHovered(reinterpret_cast<UObject*>(g_restoreHs), "restore-hs") == 1)
+            {
+                g_armKind = ARM_RESTORE;
+                g_armHs = g_restoreHs;
+                g_armRow = -1;
+            }
             if (g_armKind == ARM_NONE && g_langHs &&
                 isHovered(reinterpret_cast<UObject*>(g_langHs), "lang-cbo") == 1)
             {
@@ -8935,6 +9508,18 @@ static void pump(ULONGLONG now)
                 logf("panel: '폴더 바로가기' 클릭");
                 openPluginsFolder();  // 패널은 열린 채 유지
             }
+            else if (onIt && (kind == ARM_AUTO || kind == ARM_AUTOHELP)) {
+                autoDialog(kind == ARM_AUTOHELP); return;
+            }
+            else if (onIt && kind == ARM_RESTORE)
+            {
+                wchar_t message[768];
+                restoreSafetyMods(message, 768);
+                rebuildPanel(clone, "안전모드 복구");
+                navAfterRebuild();
+                showRestartPopup(message);
+                return;
+            }
             else if (onIt && kind == ARM_LANG)
             {
                 // v0.40: 언어 콤보 -- g_comboRow = -1 이 매니저 자체 옵션 표식
@@ -8943,6 +9528,7 @@ static void pump(ULONGLONG now)
             }
             else if (onIt && row >= 0 && row < g_plgN)
             {
+                if (autoOwnsBoot() && (kind == ARM_MOD_OFF || kind == ARM_MOD_ON)) { showRestartPopup(TR(L"모드를 직접 바꾸려면 자동복구를 먼저 OFF로 전환하세요.", L"Switch automatic recovery OFF before changing mods.")); return; }
                 PlgRow& r = g_plg[row];
                 if (kind == ARM_MOD_OFF)
                 {
@@ -8950,7 +9536,9 @@ static void pump(ULONGLONG now)
                     {
                         r.on = false;
                         paintToggle(r);
-                        applyPluginState(r);
+                        autoLoadSetChanged();
+            applyPluginState(r);
+                        needPopup = true;
                         // v0.50: 미로드 모드는 옵션 없어도 재구축 ('재시작 필요' 배지 갱신)
                         if (r.optN || !sessionLoaded(r.name)) needReopen = true;  // 옵션 서브행 접기
                     }
@@ -8961,7 +9549,9 @@ static void pump(ULONGLONG now)
                     {
                         r.on = true;
                         paintToggle(r);
-                        applyPluginState(r);
+                        autoLoadSetChanged();
+            applyPluginState(r);
+                        needPopup = true;
                         // v0.50: 미로드 모드는 옵션 없어도 재구축 ('재시작 필요' 배지 갱신)
                         if (r.optN || !sessionLoaded(r.name)) needReopen = true;  // 옵션 서브행 펼치기
                         // 이번 세션에 로드 안 된 모드를 켬 = 재시작해야 적용 -> 게임식 팝업
@@ -8970,8 +9560,8 @@ static void pump(ULONGLONG now)
                 }
                 else if (kind == ARM_FOLD)
                 {
-                    bool on = !isExpanded(r.name);
-                    setExpanded(r.name, on);
+                    bool on = !isExpanded(pluginId(r.name, r.rel, r.pak).c_str());
+                    setExpanded(pluginId(r.name, r.rel, r.pak).c_str(), on);
                     logf("panel: '%s' 옵션 %s", u8(r.name).c_str(), on ? "펼침" : "접힘");
                     needReopen = true;
                 }
@@ -10647,7 +11237,7 @@ static void onProcessEventPre(UObject* context, UFunction* function, void* parms
         // PE 호출에나 편승해 33ms 간격으로 호버/클릭/패널 입력을 처리한다.
         unsigned long gtid = g_gameThreadId.load(std::memory_order_relaxed);
         if (gtid && GetCurrentThreadId() == gtid &&
-            (g_myClone.load(std::memory_order_relaxed) || g_panel || g_panelOpen))
+            (g_myClone.load(std::memory_order_relaxed) || g_panel || g_panelOpen || g_autoLease.load(std::memory_order_relaxed)))
         {
             ULONGLONG pnow = GetTickCount64();
             if (pnow - g_lastPumpMs >= 33)
@@ -10714,7 +11304,7 @@ class DsCppModManager final : public RC::CppUserModBase
     DsCppModManager()
     {
         ModName = L"DsCppModManager";
-        ModVersion = L"0.51";
+        ModVersion = L"0.60";
         ModDescription = L"Mod manager: key-bind and color-picker option controls";
         ModAuthors = L"SummerSpring";
         logf("start_mod: ctor OK (%s)", u8(MOD_VER_W).c_str());
@@ -10724,6 +11314,7 @@ class DsCppModManager final : public RC::CppUserModBase
         {
             blackboxRotate();
             earlyBootGuard();
+            if(autoEnabled() && !autoActive()) { wchar_t message[768]; autoStart(message,768); logf("auto watchdog attach: %s",u8(message).c_str()); }
         }
         catch (...)
         {
@@ -11064,6 +11655,10 @@ class DsCppModManager final : public RC::CppUserModBase
             extractPluginZips();
             wrapLoosePaks();   // v0.40: 낱개 pak 파일 감싸기 (같은 3초 스윕)
         }
+        if(g_autoLease.load(std::memory_order_relaxed) &&
+           (GetAsyncKeyState(VK_CONTROL)&0x8000) && (GetAsyncKeyState(VK_SHIFT)&0x8000) && (GetAsyncKeyState(VK_F10)&0x8000)) autoStop();
+        static ULONGLONG autoPoll = 0;
+        if (now-autoPoll >= 1000) { autoPoll=now; g_autoLease.store(autoActive(),std::memory_order_relaxed); }
         blackboxTick(now);   // v0.50: 블랙박스 -- 모드 시작 브래킷 + 로그 꼬리 스냅샷(5초)
         if (now - m_lastBeat >= 60000)
         {

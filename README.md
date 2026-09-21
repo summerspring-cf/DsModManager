@@ -37,6 +37,33 @@ Two builds are published for each release:
 | **[Hangul Patch Studio](https://hangulpatchstudio.com/g/%EB%93%9C%EB%9E%98%EA%B3%A4%EC%86%8C%EB%93%9C-%EB%AA%A8%EB%93%9C%EB%A7%A4%EB%8B%88%EC%A0%80)** | My own distribution page. Same archive. Korean-language page, direct download, **no account or registration needed**. |
 | Nexus Mods | Currently unavailable — the upload is under automated quarantine, which is what this repository was published to help resolve. |
 
+### Linux / Steam Deck
+
+**Use the same archive — there is no separate Linux build.** On Linux the game runs through
+Proton, and the manager runs inside it just the same. Verified on a Steam Deck with Proton 11.0
+on 2026-09-22: UE4SS loads, the title-menu entry is injected, and the panel renders and works.
+
+Install it exactly as on Windows (extract the archive into the same folders), then add **one
+launch option** in Steam — right-click the game → Properties → Launch Options:
+
+```
+WINEDLLOVERRIDES="dwmapi=n,b" %command%
+```
+
+UE4SS hooks the game by shipping a file named `dwmapi.dll`, and this tells Proton to load that
+file instead of its own. It is a UE4SS requirement, not a requirement of this mod — any UE4SS
+mod needs it.
+
+Two features do not work under Proton:
+
+- **Automatic recovery** — its watchdog is a PowerShell script, and Proton's `powershell.exe`
+  is a stub that exits without running anything. The manager will say the watch is scheduled
+  and then nothing happens.
+- **Automatic zip extraction** in `plugins` — Proton has no `tar.exe`. Extract archives yourself.
+
+Everything else (enabling/disabling mods, `.pak` mods, editing settings, reordering, gamepad
+input) behaves as on Windows.
+
 ---
 
 ## Documentation
