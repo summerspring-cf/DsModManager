@@ -334,7 +334,7 @@ static wchar_t g_langChoices[2][24] = {L"한국어(Korean)", L"English"};
 // v0.51: 실수 옵션의 조절 단위 콤보 (값 칸 클릭은 "누를 수 있다"는 표시가 없어 폐기 --
 // 사용자 피드백. ◀ 왼쪽에 '단위' 라벨 + 콤보박스로 보여준다)
 static wchar_t g_unitChoices[2][24] = {L"±0.1", L"±0.01"};
-static const wchar_t* const MOD_VER_W = L"v0.60";
+static const wchar_t* const MOD_VER_W = L"v0.61";
 static void* g_padIcon = nullptr;     // 11b: 클론 항목의 패드 Y 아이콘 위젯(SizeBox).
                                       // 패드 사용 중에만 보인다(키퍼가 가시성 토글).
 static void* g_popupPadIcon = nullptr;  // v0.50: 팝업 확인버튼 (A) 아이콘 (패드 시만)
@@ -786,13 +786,67 @@ static int g_loadedN = 0;
 static std::vector<void*> g_siblings;              // 런타임 메뉴 항목 캐시 (clearOthers 용)
 static bool g_reflFault = false;                   // 이번 틱에 리플렉션 SEH 폴트 발생 (게임 스레드 전용)
 
+/*
+  v0.61 UE4SS 버전 호환 -- 런타임 조회 셋.
+  UE4SS v3.0.1 정식판에는 아래 셋이 없다(실측 2026-09-23, dumpbin 익스포트 대조):
+    ??0FText@Unreal@RC@@QEAA@PEB_W@Z    FText(const wchar_t*)
+    ?StaticSize@FText@Unreal@RC@@SAHXZ   FText::StaticSize()
+    ?IsInGameThread@Unreal@RC@@YA_NXZ    IsInGameThread()
+  정적으로 임포트하면 Windows 로더가 DLL 로드 자체를 거부해 매니저가 통째로 안 떴다
+  ("동봉한 UE4SS 에서만 된다" 제보의 원인). 그래서 이름으로 찾는다 -- GetModuleHandle +
+  GetProcAddress 이지 LoadLibrary 가 아니다(SECURITY.md 약속 유지). 나머지 18개 임포트는
+  v3.0.1 · c838a8ac · 최신 실험판(v3.0.1-1140) 모두 같은 이름으로 익스포트한다.
+  가상함수표도 우리가 덮어쓰는 0~2번(소멸자/on_update/on_unreal_init)은 세 판 모두 같다.
+*/
+struct Ue4ssOptional
+{
+    bool resolved = false;
+    void* (*ftextCtor)(void* self, const wchar_t* s) = nullptr;
+    int (*ftextSize)() = nullptr;
+    bool (*inGameThread)() = nullptr;
+};
+static Ue4ssOptional g_uo;
+
+static void resolveUe4ssOptional()
+{
+    if (g_uo.resolved) return;
+    g_uo.resolved = true;
+    HMODULE h = GetModuleHandleW(L"UE4SS.dll");
+    if (!h)
+    {
+        logf("WARN ue4ss-compat: UE4SS.dll 모듈을 못 찾음 -- 선택 기능 전부 대체 경로");
+        return;
+    }
+    g_uo.ftextCtor = reinterpret_cast<void* (*)(void*, const wchar_t*)>(
+        GetProcAddress(h, "??0FText@Unreal@RC@@QEAA@PEB_W@Z"));
+    g_uo.ftextSize = reinterpret_cast<int (*)()>(GetProcAddress(h, "?StaticSize@FText@Unreal@RC@@SAHXZ"));
+    g_uo.inGameThread = reinterpret_cast<bool (*)()>(GetProcAddress(h, "?IsInGameThread@Unreal@RC@@YA_NXZ"));
+#ifdef DSMM_FORCE_COMPAT_FALLBACK
+    // 시험 빌드 전용(배포 빌드엔 없음): v3.0.1 처럼 셋이 없는 것으로 강제해 대체 경로를 검증한다.
+    g_uo.ftextCtor = nullptr;
+    g_uo.ftextSize = nullptr;
+    g_uo.inGameThread = nullptr;
+    logf("ue4ss-compat: [시험 빌드] 셋 다 없는 것으로 강제");
+#endif
+    logf("ue4ss-compat: FText 생성자=%s StaticSize=%s IsInGameThread=%s",
+         g_uo.ftextCtor ? "있음" : "없음(엔진 변환 사용)", g_uo.ftextSize ? "있음" : "없음",
+         g_uo.inGameThread ? "있음" : "없음(cls 게이트만)");
+}
+
 static std::atomic<int> g_gtState{-1};  // -1 미확인 / 0 고장 / 1 정상
 static bool gtGate()
 {
     if (g_gtState.load(std::memory_order_relaxed) == 0) return true;
+    resolveUe4ssOptional();
+    if (!g_uo.inGameThread)
+    {
+        g_gtState.store(0, std::memory_order_relaxed);
+        logf("WARN IsInGameThread() 가 이 UE4SS 에 없음 -- cls 게이트만 사용");
+        return true;
+    }
     try
     {
-        bool r = RC::Unreal::IsInGameThread();
+        bool r = g_uo.inGameThread();
         g_gtState.store(1, std::memory_order_relaxed);
         return r;
     }
@@ -955,6 +1009,57 @@ static float getRenderOpacity(UObject* widget, const char* tag, bool* ok)
     return v;
 }
 
+// FText 24바이트 만들기 (v0.61). UE4SS 에 생성자가 있으면 그것, 없으면(v3.0.1)
+// 엔진의 KismetTextLibrary.Conv_StringToText(FString) -> FText 로 만든다.
+// 어느 쪽이든 생성만 하고 파괴하지 않는다(의도적 미세 누수 -- ue4ss_abi.hpp 규칙).
+// 게임 스레드(ProcessEvent 콜백) 안에서만 부른다.
+static bool makeFText(const wchar_t* s, RC::Unreal::FText* out)
+{
+    resolveUe4ssOptional();
+    if (g_uo.ftextCtor && g_uo.ftextSize)
+    {
+        if (g_uo.ftextSize() != 24) return false;
+        g_uo.ftextCtor(out, s);
+        return true;
+    }
+    static UObject* lib = nullptr;
+    static UFunction* conv = nullptr;
+    static bool dead = false;   // 한 번 구조가 안 맞으면 다시 시도하지 않는다(로그 폭주 방지)
+    if (dead) return false;
+    if (!conv)
+    {
+        lib = UOG::StaticFindObject_InternalSlow(nullptr, nullptr, L"/Script/Engine.Default__KismetTextLibrary", false);
+        if (!lib)
+        {
+            logf("FAIL ftext.conv: KismetTextLibrary CDO 없음");
+            dead = true;
+            return false;
+        }
+        conv = fnOf(lib, L"Conv_StringToText", "ftext.conv");
+        // FString(16) + 반환 FText(24) = 40, 반환값은 16 에서 시작해야 한다
+        if (!conv || !parmsExact(conv, 40, "ftext.conv", false) || (int)conv->GetReturnValueOffset() != 16)
+        {
+            logf("FAIL ftext.conv: Conv_StringToText 레이아웃이 가정(40/16)과 다름 -- 엔진 변환 포기");
+            conv = nullptr;
+            dead = true;
+            return false;
+        }
+        logf("ftext.conv: 엔진 변환 경로 사용 (UE4SS 에 FText 생성자 없음)");
+    }
+    // FString 입력은 엔진이 읽기만 한다(함수 안에서 복사). 우리 버퍼를 엔진이 해제하지 않는다.
+    int len = (int)wcslen(s) + 1;
+    struct FStr { const wchar_t* data; int num; int max; } str{s, len, len};
+    PB pb;
+    memcpy(pb.b, &str, sizeof(str));
+    if (!peGuard(lib, conv, pb.b))
+    {
+        logf("FAIL ftext.conv: Conv_StringToText SEH");
+        return false;
+    }
+    memcpy(out, pb.b + 16, 24);
+    return true;
+}
+
 // 라벨 설정: TitleText(DTextBlock) :SetText(FText 24바이트)
 // FText 는 생성만 하고 파괴하지 않는다(의도적 미세 누수 -- ue4ss_abi.hpp 주석).
 static bool setLabel(UObject* clone, const char* phase, bool strict = true)
@@ -967,14 +1072,14 @@ static bool setLabel(UObject* clone, const char* phase, bool strict = true)
     }
     UFunction* fn = fnOf(tt, L"SetText", "setLabel");
     if (!fn || !parmsExact(fn, 24, "setLabel.SetText")) return false;
-    if (RC::Unreal::FText::StaticSize() != 24)
+    RC::Unreal::FText txt;
+    if (!makeFText(trLabel(), &txt))
     {
         if (!strict) return false;
-        logf("FAIL setLabel: FText::StaticSize()=%d (기대 24) -- 전사 무효", RC::Unreal::FText::StaticSize());
+        logf("FAIL setLabel: FText 를 만들 수 없음 (UE4SS 생성자 없음 + 엔진 변환 실패) -- 라벨 불가");
         g_hardFail = true;
         return false;
     }
-    RC::Unreal::FText txt(trLabel());
     PB pb;
     memcpy(pb.b, &txt, 24);
     if (!peGuard(tt, fn, pb.b))
@@ -4690,8 +4795,8 @@ static bool setTextOn(UObject* tb, const wchar_t* s, const char* tag)
 {
     UFunction* fn = fnOf(tb, L"SetText", tag);
     if (!fn || !parmsExact(fn, 24, tag, false)) return false;
-    if (RC::Unreal::FText::StaticSize() != 24) return false;
-    RC::Unreal::FText txt(s);  // 의도적 미세 누수 (ue4ss_abi.hpp 규칙)
+    RC::Unreal::FText txt;
+    if (!makeFText(s, &txt)) return false;  // 의도적 미세 누수 (ue4ss_abi.hpp 규칙)
     PB pb;
     memcpy(pb.b, &txt, 24);
     if (!peGuard(tb, fn, pb.b)) { logf("FAIL %s: SetText SEH", tag); return false; }
@@ -11304,7 +11409,7 @@ class DsCppModManager final : public RC::CppUserModBase
     DsCppModManager()
     {
         ModName = L"DsCppModManager";
-        ModVersion = L"0.60";
+        ModVersion = L"0.61";
         ModDescription = L"Mod manager: key-bind and color-picker option controls";
         ModAuthors = L"SummerSpring";
         logf("start_mod: ctor OK (%s)", u8(MOD_VER_W).c_str());

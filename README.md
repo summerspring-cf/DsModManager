@@ -35,7 +35,14 @@ Two builds are published for each release:
 |---|---|
 | **[GitHub Releases](https://github.com/summerspring-cf/DsModManager-Release/releases)** | Canonical, in the separate [release repository](https://github.com/summerspring-cf/DsModManager-Release). SHA-256 published in [SECURITY.md](SECURITY.md#5-verifying-the-release-binaries). |
 | **[Hangul Patch Studio](https://hangulpatchstudio.com/g/%EB%93%9C%EB%9E%98%EA%B3%A4%EC%86%8C%EB%93%9C-%EB%AA%A8%EB%93%9C%EB%A7%A4%EB%8B%88%EC%A0%80)** | My own distribution page. Same archive. Korean-language page, direct download, **no account or registration needed**. |
-| Nexus Mods | Currently unavailable — the upload is under automated quarantine, which is what this repository was published to help resolve. |
+| **[Nexus Mods](https://www.nexusmods.com/dragonswordawakening/mods/160)** | A reduced build (`main.dll` + docs only — no UE4SS, no `install.bat`, no automatic recovery) so that it passes Nexus's automated scan. For the full build use GitHub Releases above. |
+
+### Supported UE4SS versions
+
+**From UE4SS v3.0.0 (stable, 2024-02) up to the latest experimental build v3.0.1-1140-gf58e8f84 (2026-09-21).**
+Tested in game on v3.0.0, v3.0.1, the bundled experimental build `c838a8ac`, and v3.0.1-1140.
+UE4SS older than v3.0.0 does not support this game's engine (UE 5.3), so it cannot be used at all.
+(Before v0.61 the manager only loaded on experimental builds from 2026-01 onward.)
 
 ### Linux / Steam Deck
 
@@ -212,11 +219,11 @@ Releases of this mod **include UE4SS**.
 The file in `vendor/ue4ss/` is the **unmodified official archive**, byte-for-byte. Hashes are
 in [vendor/ue4ss/README.md](vendor/ue4ss/README.md) and [SECURITY.md](SECURITY.md).
 
-**Why pin this specific build:** the mod DLL is linked against the export table of *this*
-UE4SS build. The stock 3.0.1 release exports a different set, and on a mismatched build the
-mod DLL is simply refused — the game still launches normally, the mod just never appears.
-The experimental channel is a moving target, so downloading it today is not guaranteed to
-produce commit `c838a8ac`. Pinning it is the only way to make the release reliably work.
+**Why bundle this specific build:** it is the build the mod is developed and tested on, and the
+experimental channel is a moving target. You do not have to use it, though: since v0.61 the
+mod DLL only links against UE4SS exports that exist in every release from v3.0.0 on, and looks
+up the three newer ones at runtime (falling back to the engine's own `KismetTextLibrary`
+when they are missing). See *Supported UE4SS versions* above.
 
 UE4SS is redistributed under the MIT License; its full licence text ships as `ue4ss/LICENSE`
 inside every release archive.

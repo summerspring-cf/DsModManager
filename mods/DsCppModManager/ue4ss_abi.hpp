@@ -129,8 +129,8 @@ namespace RC
   - UObjectBase::GetClassPrivate
   - UFunction::GetParmsSize / GetReturnValueOffset / GetNumParms
   - FField::GetName, FProperty::GetOffset_Internal / GetSize
-  - FText(const wchar_t*) 생성자 + FText::StaticSize()
-  - RC::Unreal::IsInGameThread()
+  - (v0.61 부터 런타임 조회로 바뀐 셋 -- UE4SS v3.0.1 에 없음)
+    FText(const wchar_t*) 생성자 · FText::StaticSize() · RC::Unreal::IsInGameThread()
 
   상속 사슬 단순화 근거: 실제 사슬(UObjectBase→UObjectBaseUtility→UObject
   →UField→UStruct→UFunction/UClass, FField→FProperty)은 전부 오프셋 0
@@ -206,21 +206,21 @@ namespace RC::Unreal
 
     /*
       FText -- 유일하게 "값 타입"으로 전사하는 예외.
-      근거: (1) 이 게임(UE 5.3.2)의 UTextBlock:SetText parmSize = 24 실측
-            (2) UE4SS.def:3473 에 StaticSize() 가 있어 런타임 재검증 가능.
+      근거: 이 게임(UE 5.3.2)의 UTextBlock:SetText parmSize = 24 실측.
       사용 규칙: 생성만 하고 파괴하지 않는다(소멸자 미선언 = trivial).
       공유 레퍼런스 1개가 의도적으로 누수되는데, 삽입 1회당 수십 바이트라
       무해하고, 잘못된 해제(레이아웃 가정 위반)보다 압도적으로 안전하다.
-      반드시 FText::StaticSize() == 24 확인 후 사용할 것.
+
+      ⚠ v0.61: 생성자와 StaticSize() 를 **정적 임포트하지 않는다.** UE4SS v3.0.1
+      정식판에는 둘 다 없어서(실측 2026-09-23), 임포트하면 Windows 로더가 DLL 로드를
+      거부해 매니저가 통째로 안 떴다. 이제 main.cpp 의 makeFText() 가 런타임에
+      이름으로 찾아 쓰고, 없으면 엔진의 KismetTextLibrary.Conv_StringToText 로 만든다.
+      여기는 24바이트 그릇일 뿐이다.
     */
     class FText
     {
       public:
         unsigned char opaque[24];
-        // UE4SS.def:135  ??0FText@Unreal@RC@@QEAA@PEB_W@Z
-        __declspec(dllimport) FText(const wchar_t* str);
-        // UE4SS.def:3473  ?StaticSize@FText@...SAHXZ
-        __declspec(dllimport) static auto StaticSize() -> int;
     };
     static_assert(sizeof(FText) == 24, "FText 전사 크기가 실측(24)과 다름");
 
@@ -256,8 +256,9 @@ namespace RC::Unreal
                                                                  bool exact_class) -> UObject*;
     } // namespace UObjectGlobals
 
-    // UE4SS.def:2543  bool IsInGameThread()
-    __declspec(dllimport) auto IsInGameThread() -> bool;
+    // IsInGameThread() 는 v0.61 부터 정적 임포트하지 않는다 -- UE4SS v3.0.1 정식판에
+    // 없어서 DLL 로드 자체가 거부됐다. main.cpp 의 gtGate() 가 런타임에 이름으로 찾는다
+    // (?IsInGameThread@Unreal@RC@@YA_NXZ). 없으면 기존 '고장' 경로(cls 게이트만).
 
     namespace Hook
     {

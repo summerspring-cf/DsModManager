@@ -4,7 +4,9 @@ DsCppModManager 배포 패키지 생성기.
 
 산출물 (Plugins_Publish/ — 배포 규약: 저장소 루트 PACKAGING.md):
   ① DsCppModManager_<버전>.zip           <- UE4SS **동봉** (한글패치스튜디오/일반 배포)
-  ② DsCppModManager-NoUE4SS_<버전>.zip    <- UE4SS **미동봉** (Nexus Mods 용)
+  ② DsCppModManager-NoUE4SS_<버전>.zip    <- UE4SS **미동봉**
+  ③ DsCppModManager-Nexus_<버전>.zip      <- 넥서스 업로드 전용 (--nexus 로 따로 만든다.
+                                           UE4SS·install.bat·자동복구 .ps1 없음, 한/영 README)
 
 동봉판 구조:
   DsCppModManager/            <- 게임 ue4ss/Mods/ 에 그대로 풀면 되는 폴더
@@ -99,13 +101,15 @@ README_BUNDLED = f"""DsCppModManager v{VERSION} — DragonSword: Awakening 용 C
   동봉된 UE4SS: 실험 채널 빌드 커밋 c838a8ac
                 UE4SS.dll {UE4SS_SIZE:,} 바이트
                 SHA256 {UE4SS_SHA256}
-  이 모드는 바로 그 빌드에서 빌드/검증되었습니다. 다른 버전의 UE4SS 위에서는
-  모드 DLL 로드가 거부될 수 있습니다(게임은 정상 실행되고 모드만 꺼집니다).
+  지원하는 UE4SS 버전: v3.0.0 정식 버전(2024-02) 부터
+                       최신 실험 버전 v3.0.1-1140-gf58e8f84(2026-09-21) 까지
+    (실제 게임에서 확인: v3.0.0 · v3.0.1 · 동봉 버전 c838a8ac · v3.0.1-1140)
+  v3.0.0 보다 옛 UE4SS 는 이 게임의 엔진(UE 5.3)을 지원하지 않습니다.
   UE4SS 는 MIT 라이선스로 재배포됩니다 — 전문은 ue4ss\\LICENSE 에 있습니다.
 
   ※ 이미 다른 UE4SS 를 쓰고 계신 경우
-    install.bat 은 기존 UE4SS 를 절대 덮어쓰지 않습니다. 설치는 되지만
-    모드매니저가 뜨지 않는다면 UE4SS 버전이 달라서일 수 있습니다. 그때는
+    install.bat 은 기존 UE4SS 를 절대 덮어쓰지 않습니다. 위 지원 버전이면
+    그대로 동작합니다. 모드매니저가 뜨지 않는다면 그때는
     ue4ss 폴더를 통째로 지우고 install.bat 을 다시 실행하세요.
     (다른 모드를 쓰고 계신다면 Mods 폴더를 먼저 백업하세요)
 
@@ -123,7 +127,7 @@ README_BUNDLED = f"""DsCppModManager v{VERSION} — DragonSword: Awakening 용 C
     - plugins 폴더에 넣어 둔 모드들
     - 각 모드의 설정값(dsoptions.txt)과 켬/끔 상태
     - 순서 탭에서 정한 모드 순서(dsorder.txt)
-  설치 후 게임에서 [모드매니저 → 기본 → 모드 버전] 값이 이 배포판의 버전과
+  설치 후 게임에서 [모드매니저 → 기본 → 모드 버전] 값이 이 배포본의 버전과
   같은지 확인하세요. 다르면 게임이 켜진 채로 설치해서 덮어쓰기가 실패한 것입니다.
 
 ■ 설치 방법 2 — 수동
@@ -174,7 +178,7 @@ README_BUNDLED = f"""DsCppModManager v{VERSION} — DragonSword: Awakening 용 C
 
 README_UNBUNDLED = f"""DsCppModManager v{VERSION} — DragonSword: Awakening 용 C++ 모드매니저
 =====================================================================
-(UE4SS 미동봉판 — UE4SS 가 이미 설치되어 있어야 합니다)
+(UE4SS 미동봉 버전 — UE4SS 가 이미 설치되어 있어야 합니다)
 
 ■ 전제 조건 — UE4SS 필요
   이 배포본에는 UE4SS 가 **들어 있지 않습니다.** 게임에 UE4SS 가 이미 설치되어
@@ -183,11 +187,10 @@ README_UNBUNDLED = f"""DsCppModManager v{VERSION} — DragonSword: Awakening 용
   (UE4SS 를 함께 담은 올인원 배포본도 따로 있습니다 — UE4SS 설치가 번거로우면
    그쪽을 쓰세요.)
 
-  ※ 이 모드는 UE4SS 실험 채널 빌드 커밋 c838a8ac
-    (UE4SS.dll {UE4SS_SIZE:,} 바이트) 에서 빌드/검증되었습니다.
-    다른 버전의 UE4SS 위에서는 모드 DLL 로드가 거부될 수 있습니다
-    (게임은 정상 실행되고 모드만 꺼집니다). 모드매니저가 안 보이면
-    UE4SS 버전이 원인일 수 있습니다.
+  ※ 지원하는 UE4SS 버전: v3.0.0 정식 버전(2024-02) 부터
+                          최신 실험 버전 v3.0.1-1140-gf58e8f84(2026-09-21) 까지
+      (실제 게임에서 확인: v3.0.0 · v3.0.1 · c838a8ac · v3.0.1-1140)
+    v3.0.0 보다 옛 UE4SS 는 이 게임의 엔진(UE 5.3)을 지원하지 않습니다.
 
 ■ 설치 방법 1 — 자동 (권장)
   1) ★ 게임을 완전히 종료합니다. (실행 중이면 모드 파일이 잠겨 설치가 실패합니다)
@@ -242,6 +245,95 @@ README_UNBUNDLED = f"""DsCppModManager v{VERSION} — DragonSword: Awakening 용
   CHANGELOG.md    — 버전별 변경 내역
   PLUGIN_GUIDE.md — 모드 제작자용 연동 가이드 (dsplugin.ini 계약)
 """
+
+README_NEXUS = f"""DsCppModManager v{VERSION} — DragonSword: Awakening Mod Manager (Nexus Mods build)
+=====================================================================
+[한국어]  아래에 English 가 있습니다 / English below.
+
+■ 이 파일은 넥서스모드용 버전입니다 — 일부 기능이 빠져 있습니다
+  넥서스의 자동 검사에 걸리지 않도록, 스크립트와 동봉 프로그램을 뺀 버전입니다.
+  - UE4SS 가 들어 있지 않습니다 (먼저 설치되어 있어야 합니다)
+  - 자동 설치 파일(install.bat)이 없습니다 (아래처럼 폴더를 복사합니다)
+  - ⚠ 자동일괄복구모드가 동작하지 않습니다 (감시 도우미가 빠져 있습니다).
+    켜면 "복구 도우미 파일이 없습니다" 가 뜹니다.
+  나머지 기능은 모두 같습니다.
+
+  ▶ 모든 기능이 들어 있는 전체 버전(UE4SS 동봉 · 자동 설치 · 자동일괄복구모드)은
+    아래에서 받으세요:
+    한글패치스튜디오 : https://hangulpatchstudio.com/g/드래곤소드-모드매니저
+    GitHub          : https://github.com/summerspring-cf/DsModManager-Release/releases
+
+■ 필요한 것 — UE4SS
+  https://github.com/UE4SS-RE/RE-UE4SS
+  지원하는 UE4SS 버전: v3.0.0 정식 버전(2024-02) 부터
+                       최신 실험 버전 v3.0.1-1140-gf58e8f84(2026-09-21) 까지
+    (실제 게임에서 확인: v3.0.0 · v3.0.1 · c838a8ac · v3.0.1-1140)
+  v3.0.0 보다 옛 UE4SS 는 이 게임의 엔진(UE 5.3)을 지원하지 않습니다.
+  (내 UE4SS 버전: ue4ss\\UE4SS.log 두 번째 줄의 "Git SHA #" 뒤)
+  UE4SS 설치가 번거로우면 위의 전체 버전을 쓰세요 — UE4SS 가 함께 들어 있습니다.
+
+■ 설치
+  1) 게임을 완전히 종료합니다.
+  2) DsCppModManager 폴더를 통째로 아래에 복사합니다:
+       <게임>\\DS\\Binaries\\Win64\\ue4ss\\Mods\\
+     (DragonSword 와 Awakening 사이 공백은 두 칸입니다)
+  3) 게임을 켜서 메인 메뉴에 "모드매니저" 가 보이면 성공입니다.
+  mods.txt 는 고치지 않아도 됩니다 (폴더 안 enabled.txt 로 자동 시작).
+
+■ 리눅스 / 스팀덱
+  같은 파일을 그대로 씁니다. 스팀 실행 옵션에 한 줄을 넣어 주세요:
+    WINEDLLOVERRIDES="dwmapi=n,b" %command%
+  (스팀 라이브러리 -> 게임 우클릭 -> 속성 -> 실행 옵션)
+  리눅스에서는 zip 자동 압축 해제가 되지 않습니다.
+
+■ 제거
+  Mods\\DsCppModManager 폴더를 지우면 됩니다.
+
+■ 문서: MANUAL.md(설명서) · CHANGELOG.md(변경 내역) · PLUGIN_GUIDE.md(모드 제작자용)
+
+=====================================================================
+[English]
+
+■ This is the Nexus Mods build — some features are left out
+  Scripts and bundled programs are removed so the file passes Nexus's automated checks.
+  - UE4SS is NOT included (install it first)
+  - There is no installer (install.bat) — copy the folder as shown below
+  - ⚠ Automatic recovery does NOT work (its watchdog helper is not included).
+    Switching it on shows "Recovery helper is missing".
+  Everything else is identical.
+
+  ▶ For the full build (UE4SS bundled, installer, automatic recovery), download it here:
+    https://github.com/summerspring-cf/DsModManager-Release/releases
+
+■ Requirement — UE4SS
+  https://github.com/UE4SS-RE/RE-UE4SS
+  Supported UE4SS versions: from stable v3.0.0 (2024-02)
+                             to latest experimental v3.0.1-1140-gf58e8f84 (2026-09-21)
+    (tested in game: v3.0.0 / v3.0.1 / c838a8ac / v3.0.1-1140)
+  UE4SS older than v3.0.0 does not support this game's engine (UE 5.3).
+  (Your UE4SS build: second line of ue4ss\\UE4SS.log, after "Git SHA #")
+  If installing UE4SS is a hassle, use the full build above — UE4SS is included.
+
+■ Install
+  1) Close the game completely.
+  2) Copy the whole DsCppModManager folder into:
+       <game>\\DS\\Binaries\\Win64\\ue4ss\\Mods\\
+     (note: there are TWO spaces between DragonSword and Awakening)
+  3) Start the game. If "ModManager" appears in the main menu, you are done.
+  No need to edit mods.txt — the enabled.txt inside the folder starts it.
+
+■ Linux / Steam Deck
+  Use the same file. Add this Steam launch option:
+    WINEDLLOVERRIDES="dwmapi=n,b" %command%
+  (Steam library -> right-click the game -> Properties -> Launch Options)
+  Automatic zip extraction does not work on Linux.
+
+■ Uninstall
+  Delete the Mods\\DsCppModManager folder.
+
+■ Docs: MANUAL.md (manual, Korean) · CHANGELOG.md · PLUGIN_GUIDE.md (for mod authors)
+"""
+
 
 # ------------------------------------------------------------------ install.bat
 
@@ -409,7 +501,7 @@ if not "!UESZ!"=="%UESIZE%" set "UEMSG=UE4SS : 설치된 버전이 검증본과 
 # 미동봉판: UE4SS 없음 라벨.
 _UE_LABELS_UNBUNDLED = r"""
 :no_ue4ss
-set "MSG=UE4SS 가 설치되어 있지 않습니다.[br][br]위치 : %UE%[br][br]이 배포본에는 UE4SS 가 들어 있지 않습니다(미동봉판).[br]먼저 UE4SS 를 설치한 뒤 다시 실행해 주세요.[br]  UE4SS: github.com/UE4SS-RE/RE-UE4SS[br][br]UE4SS 설치가 번거로우면 UE4SS 동봉 올인원[br]배포본을 대신 사용하세요."
+set "MSG=UE4SS 가 설치되어 있지 않습니다.[br][br]위치 : %UE%[br][br]이 배포본에는 UE4SS 가 들어 있지 않습니다(미동봉 버전).[br]먼저 UE4SS 를 설치한 뒤 다시 실행해 주세요.[br]  UE4SS: github.com/UE4SS-RE/RE-UE4SS[br][br]UE4SS 설치가 번거로우면 UE4SS 동봉 올인원[br]배포본을 대신 사용하세요."
 set "ICON=16"
 goto :say
 """
@@ -420,7 +512,7 @@ def make_install_bat(bundled):
     header = ("@echo off\n"
               "rem ============================================================\n"
               f"rem  DsCppModManager {VERSION} installer  "
-              + ("(UE4SS 동봉판)\n" if bundled else "(UE4SS 미동봉판 -- Nexus)\n") +
+              + ("(UE4SS 동봉 버전)\n" if bundled else "(UE4SS 미동봉 버전 -- Nexus)\n") +
               "rem  * cp949(ANSI) + CRLF 로 저장된다.\n"
               "rem  * 결과는 항상 팝업으로 알린다.\n"
               "rem  * UE4SS 는 " + ("없으면 넣고 있으면 건드리지 않는다.\n" if bundled
@@ -445,10 +537,13 @@ def make_install_bat(bundled):
     return text
 
 
-def write_manager(z):
-    """DsCppModManager/* (매니저 본체) — 두 배포본이 공유한다."""
+def write_manager(z, with_helper=True):
+    """DsCppModManager/* (매니저 본체) — 세 배포본이 공유한다.
+    넥서스판(with_helper=False)은 자동복구 도우미 .ps1 을 뺀다 -- 넥서스는 스크립트
+    형식을 격리 사유로 본다(help.nexusmods.com/article/117)."""
     z.write(os.path.join(MOD, "main.dll"), "DsCppModManager/dlls/main.dll")
-    z.write(os.path.join(MOD, "recovery_watchdog.ps1"), "DsCppModManager/recovery_watchdog.ps1")
+    if with_helper:
+        z.write(os.path.join(MOD, "recovery_watchdog.ps1"), "DsCppModManager/recovery_watchdog.ps1")
     assets = os.path.join(MOD, "Assets")
     for fn in sorted(os.listdir(assets)):
         if fn.lower().endswith(".png"):
@@ -511,7 +606,45 @@ def build(bundled, ue4ss_payload):
     return out
 
 
+NEXUS_BANNED_EXT = (".bat", ".cmd", ".ps1", ".vbs", ".js", ".exe", ".zip", ".7z", ".rar")
+
+
+def build_nexus():
+    """넥서스 업로드 전용판 (2026-09-23 사용자 지시).
+
+    넥서스 격리 사유(도움말 117): 스크립트 같은 위험 형식 / VirusTotal 다수 탐지 /
+    zip 안의 zip. 그래서 UE4SS(dwmapi.dll 대리 로더·UE4SS.dll), install.bat,
+    자동복구 도우미 .ps1 을 **전부 뺀다**. 남는 실행 파일은 모드 본체 main.dll 하나.
+    ⚠ 다른 두 판은 여기서 다시 만들지 않는다 -- 이미 발행돼 해시가 공개돼 있다.
+    """
+    name = "DsCppModManager-Nexus"
+    dspublish.archive_previous(name)
+    out = os.path.join(OUT_DIR, f"{name}_{VERSION}.zip")
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        write_manager(z, with_helper=False)
+        z.writestr("DsCppModManager/README.txt", "﻿" + README_NEXUS)
+    check_clean(out, False)
+    bad = []
+    with zipfile.ZipFile(out) as z:
+        for n in z.namelist():
+            if n.lower().endswith(NEXUS_BANNED_EXT):
+                bad.append(n)
+            if n.lower().endswith(".dll") and n != "DsCppModManager/dlls/main.dll":
+                bad.append(n)
+    if bad:
+        os.remove(out)
+        sys.exit("[ERROR] 넥서스판에 격리 위험 파일 -- zip 을 지웠다:\n  " + "\n  ".join(bad))
+    print(f"패키지 생성: {out} ({os.path.getsize(out):,} bytes)")
+    with zipfile.ZipFile(out) as z:
+        print(f"  entries: {len(z.namelist())}")
+    return out
+
+
 def main():
+    if "--nexus" in sys.argv:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        build_nexus()
+        return
     dll = os.path.join(MOD, "main.dll")
     if not os.path.exists(dll):
         sys.exit(f"[ERROR] 없음: {dll}")
