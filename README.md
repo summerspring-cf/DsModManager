@@ -44,6 +44,11 @@ Tested in game on v3.0.0, v3.0.1, the bundled experimental build `c838a8ac`, and
 UE4SS older than v3.0.0 does not support this game's engine (UE 5.3), so it cannot be used at all.
 (Before v0.61 the manager only loaded on experimental builds from 2026-01 onward.)
 
+**지원 UE4SS 버전 (한국어)** — **UE4SS v3.0.0 정식 버전(2024-02)부터 최신 실험 버전 v3.0.1-1140-gf58e8f84(2026-09-21)까지.**
+실제 게임에서 v3.0.0 · v3.0.1 · 동봉 버전 `c838a8ac` · v3.0.1-1140 을 확인했습니다.
+v3.0.0 보다 옛 UE4SS 는 이 게임의 엔진(UE 5.3)을 지원하지 않아 쓸 수 없습니다.
+넥서스 파일은 넥서스 자동 검사를 통과하도록 `main.dll` 과 문서만 담은 버전입니다(UE4SS · install.bat · 자동일괄복구 없음). 전체 버전은 위 GitHub Releases 에서 받으세요.
+
 ### Linux / Steam Deck
 
 **Use the same archive — there is no separate Linux build.** On Linux the game runs through
